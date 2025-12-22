@@ -51,3 +51,11 @@ settings didn't make it to ka9q-radio.
 When switching sample rates there may be no data coming from pcmrecord for a few
 seconds or more, or not at all if the rate is above 192k unless I add 100 Hz.
 I'm not sure where the problem lies.
+
+Screenshots:
+
+<img width="283" height="275" alt="thetis" src="https://github.com/user-attachments/assets/0d5da337-150c-4b89-ad53-f9e6a51db5cd" />
+<img width="413" height="235" alt="sparksdr" src="https://github.com/user-attachments/assets/881db0bb-49f9-48f6-b034-8fb5e906c91e" />
+<img width="250" height="262" alt="skimsvr" src="https://github.com/user-attachments/assets/7f0c231c-f14d-46f9-a836-9f8f1e751ccf" />
+
+
