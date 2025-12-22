@@ -1,0 +1,29 @@
+diff --git a/src/rx888.c b/src/rx888.c
+index e53eb8f..67e82ef 100644
+--- a/src/rx888.c
++++ b/src/rx888.c
+@@ -616,6 +616,24 @@ static void rx_callback(struct libusb_transfer * const transfer){
+     if(libusb_submit_transfer(transfer) == 0)
+       sdr->xfers_in_progress++;
+   }
++
++#if 1
++  // periodically copy ADC data to ramdisk for wideband use
++  FILE *binary_file = NULL;
++  static int64_t lastwbt = 0, thiswbt = 0;
++  char *filename = "/dev/shm/rx888wb.bin";
++  thiswbt = gps_time_ns();
++  if(thiswbt > lastwbt + 66*MILLION){ // 66ms
++    lastwbt = thiswbt;
++    if ((binary_file = fopen(filename, "wb")) == NULL) {
++      perror("Error opening rx888wb.bin file");
++    } else {
++      fwrite((int16_t *)transfer->buffer, sizeof(uint16_t), 16384, binary_file);
++      fclose(binary_file);
++    }
++  }
++#endif
++
+   write_rfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT if block is complete
+ }
+ 

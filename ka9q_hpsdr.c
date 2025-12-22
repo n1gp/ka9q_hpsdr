@@ -1,0 +1,1217 @@
+/* Copyright (C)
+*   11/2025 - Rick Koch, N1GP
+*   Wrote ka9q_hpsdr with the help of various open sources on the internet.
+*     Christoph v. Wüllen, https://github.com/dl1ycf/pihpsdr
+*     John Melton, https://github.com/g0orx/linhpsdr
+*     Phil Karn, https://github.com/ka9q/ka9q-radio
+*
+*   It uses HPSDR Protocol-2 defined here:
+*     https://github.com/TAPR/OpenHPSDR-Firmware/blob/master/Protocol%202/Documentation/openHPSDR%20Ethernet%20Protocol%20v4.3.pdf
+*
+*   This program is free software: you can redistribute it and/or modify
+*   it under the terms of the GNU General Public License as published by
+*   the Free Software Foundation, either version 3 of the License, or
+*   (at your option) any later version.
+*
+*   This program is distributed in the hope that it will be useful,
+*   but WITHOUT ANY WARRANTY; without even the implied warranty of
+*   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+*   GNU General Public License for more details.
+*
+*   You should have received a copy of the GNU General Public License
+*   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+*
+*/
+
+/*
+ * This program simulates an HPSDR Hermes board with 8 receiver slices
+ * using multicast data from ka9q-radio. Currently it expects ka9q-radio
+ * to be setup and using an RX-888 (MkII) SDR but I've tested an RTL Blog V4
+ * and it seems to work.
+ */
+
+#include "ka9q_hpsdr.h"
+
+static int do_exit = 0;
+struct main_cb mcb;
+static int sock_udp;
+
+static u_int send_flags = 0;
+static u_int done_send_flags = 0;
+static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t send_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t done_send_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t done_send_cond = PTHREAD_COND_INITIALIZER;
+
+static pthread_t hpsdrsim_sendiq_thr_id[MAX_RCVRS];
+
+static int running = 0;
+static bool gen_rcvd = false;
+static bool wbenable = false;
+static int wide_len;
+static int wide_size;
+static int wide_rate;
+static int wide_ppf;
+
+static struct sockaddr_in addr_new;
+
+// protocol2 stuff
+static int bits = -1;
+static long rxfreq[MAX_RCVRS];
+static int ddcenable[MAX_RCVRS];
+static int rxrate[MAX_RCVRS];
+static int adcdither = -1;
+static int adcrandom = -1;
+static int stepatt0 = -1;
+static int ddc_port = 1025;
+static int mic_port = 1026;
+static int hp_port = 1027; // also wb_port
+static int ddc0_port = 1035;
+static unsigned char pbuf[MAX_RCVRS][238*6];
+
+static int hp_sock;
+
+static pthread_t highprio_thread_id = 0;
+static pthread_t ddc_specific_thread_id = 0;
+static pthread_t mic_thread_id = 0;
+static pthread_t wb_thread_id = 0;
+static pthread_t rx_thread_id[MAX_RCVRS] = {0,};
+static void   *highprio_thread(void*);
+static void   *ddc_specific_thread(void*);
+static void   *mic_thread(void *);
+static void   *wb_thread(void *);
+static void   *rx_thread(void *);
+
+// using clock_nanosleep of librt
+extern int clock_nanosleep(clockid_t __clock_id, int __flags,
+                           __const struct timespec *__req,
+                           struct timespec *__rem);
+
+#ifdef USE_INSTALLED_TOOLS
+void run_cmd(char *cmd)
+{
+    pid_t pid;
+    char *argv[] = {"sh", "-c", cmd, NULL};
+    int status;
+
+    t_print("Run command: %s\n", cmd);
+    status = posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ);
+    if (status == 0) {
+        //t_print("Child pid: %i\n", pid);
+        do {
+            if (waitpid(pid, &status, 0) != -1) {
+                //t_print("Child status %d\n", WEXITSTATUS(status));
+            } else {
+                t_perror("waitpid");
+                exit(1);
+            }
+        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+    } else {
+        t_print("posix_spawn: %s\n", strerror(status));
+    }
+}
+#else
+const char *App_path;
+void sendCommand(const void *buf, int len, struct rcvr_cb *rcb)
+{
+    if (send(rcb->mControl_sock, buf, len, 0) != len) {
+        t_print("mControl_sock:%d rx:%d send() error\n", rcb->mControl_sock, rcb->rcvr_num);
+    }
+}
+
+int setupStream(struct rcvr_cb *rcb)
+{
+    struct sockaddr_storage Control_address;
+    char iface[1024];
+    resolve_mcast(mcb.control_maddr, &Control_address, DEFAULT_STAT_PORT, iface, sizeof(iface), 0);
+
+    rcb->mStatus_sock = listen_mcast(NULL, &Control_address, iface);
+    if (rcb->mStatus_sock == -1) {
+        t_print("listen_mcast failed\n");
+    }
+
+    int Mcast_ttl = 0; //RRK was 1
+    int IP_tos = 0;
+    rcb->mControl_sock = connect_mcast(&Control_address, iface, Mcast_ttl, IP_tos);
+    if (rcb->mControl_sock == -1) {
+        t_print("connect_mcast failed\n");
+    }
+
+    uint8_t cmd_buffer[PKTSIZE];
+    uint8_t *bp = cmd_buffer;
+    *bp++ = 1; // Generate command packet
+    uint32_t sent_tag = arc4random();
+    encode_int(&bp, COMMAND_TAG, sent_tag);
+    encode_int(&bp, OUTPUT_SSRC, rcb->ssrc);
+    const char *Mode = "iq";
+    encode_string(&bp, PRESET, Mode, strlen(Mode));
+    encode_eol(&bp);
+
+    int cmd_len = bp - cmd_buffer;
+    sendCommand(cmd_buffer, cmd_len, rcb);
+    rcb->mInput_fd = setup_mcast_in(NULL, NULL,mcb.data_maddr, NULL, 0, 0);
+    if (rcb->mInput_fd == -1) {
+        t_print("mInput_fd == -1\n");
+    }
+
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = 100000;
+    if (setsockopt(rcb->mInput_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        t_print("setsockopt() error\n");
+    }
+
+    return rcb->mInput_fd;
+}
+
+void closeStream(struct rcvr_cb *rcb)
+{
+    uint8_t cmd_buffer[PKTSIZE];
+    uint8_t *bp = cmd_buffer;
+    *bp++ = 1; // Generate command packet
+    uint32_t sent_tag = arc4random();
+    encode_int(&bp, COMMAND_TAG, sent_tag);
+    encode_int(&bp, OUTPUT_SSRC, rcb->ssrc);
+    encode_double(&bp, RADIO_FREQUENCY, 0);
+    encode_eol(&bp);
+
+    int cmd_len = bp - cmd_buffer;
+    sendCommand(cmd_buffer, cmd_len, rcb);
+
+    rcb->mInput_fd = -1;
+}
+
+void setFrequency(struct rcvr_cb *rcb)
+{
+    uint8_t cmd_buffer[PKTSIZE];
+    uint8_t *bp = cmd_buffer;
+    *bp++ = 1; // Generate command packet
+    uint32_t sent_tag = arc4random();
+    encode_int(&bp, COMMAND_TAG, sent_tag);
+    encode_int(&bp, OUTPUT_SSRC, rcb->ssrc);
+    encode_double(&bp, RADIO_FREQUENCY, (double)rcb->new_freq);
+    //encode_double(&bp, RADIO_FREQUENCY, (double)(rcb->new_freq*10+4611000));
+    encode_eol(&bp);
+    t_print("%s(), rx:%d frequency:%d\n", __FUNCTION__, rcb->rcvr_num, rcb->new_freq);
+
+    int cmd_len = bp - cmd_buffer;
+    sendCommand(cmd_buffer, cmd_len, rcb);
+}
+
+// seems to be a DSP problem in ka9q-radio when switching sample rates
+// there may be no data coming from pcmrecord for a few seconds or more
+// or not at all if the rate is above 192k unless I add 100 Hz
+void setSampleRate(struct rcvr_cb *rcb)
+{
+    int rate = rcb->output_rate;
+    enum encoding Encoding = F32LE;
+    uint8_t cmd_buffer[PKTSIZE];
+    uint8_t *bp = cmd_buffer;
+    *bp++ = 1; // Generate command packet
+    uint32_t sent_tag = arc4random();
+    encode_int(&bp, COMMAND_TAG, sent_tag);
+    encode_int(&bp, OUTPUT_SSRC, rcb->ssrc);
+    encode_int(&bp, OUTPUT_SAMPRATE, (rate>192000)?rate+100:rate);
+    encode_float(&bp, LOW_EDGE, (int)(rate * -0.49));
+    encode_float(&bp, HIGH_EDGE, (int)(rate * 0.49));
+
+    encode_float(&bp, GAIN, (float)mcb.gain);
+    encode_float(&bp, RF_ATTEN, (float)mcb.att);
+    encode_int(&bp, AGC_ENABLE, false);
+    // encode_int(&bp, AGC_ENABLE, true);
+    encode_int(&bp, OUTPUT_ENCODING, Encoding);
+    encode_eol(&bp);
+    t_print("%s(), rx:%d rate:%d Lfilt:%.1lf Hfilt:%.1lf Attn:%.1d Gain:%.1d\n", __FUNCTION__,
+            rcb->rcvr_num, rate, rate * -0.49, rate * 0.49, mcb.att, mcb.gain);
+
+    int cmd_len = bp - cmd_buffer;
+    sendCommand(cmd_buffer, cmd_len, rcb);
+}
+
+int readStream(float *buffs, const size_t numElems, struct rcvr_cb *rcb)
+{
+    int mbytesPerSample = 4; // floats
+
+    char *out = (char *) &buffs[0];
+
+    struct sockaddr sender;
+    socklen_t socksize = sizeof(sender);
+
+    int nRead = 0;
+
+    while (nRead < numElems) {
+        int toCopy = MIN((rcb->mbufferLen - rcb->mbufferOffset) / (2 * mbytesPerSample), (int)(numElems - nRead));
+        if (toCopy > 0) {
+            int copyBytes = 2 * toCopy * mbytesPerSample;
+            memcpy(out, rcb->mdp, copyBytes);
+            out += copyBytes;
+            rcb->mdp += copyBytes;
+            rcb->mbufferOffset += copyBytes;
+            nRead += toCopy;
+        } else {
+            int size = recvfrom(rcb->mInput_fd, rcb->mbuffer, sizeof(rcb->mbuffer), 0, &sender, &socksize);
+            if (size == -1 || size < RTP_MIN_SIZE) {
+                continue;
+            }
+
+            struct rtp_header rtp;
+            uint8_t *dp = (uint8_t *)ntoh_rtp(&rtp, rcb->mbuffer);
+
+            if(rtp.ssrc != rcb->ssrc) {
+                continue;
+            }
+
+            size -= dp - rcb->mbuffer;
+            if (rtp.pad) {
+                // Remove padding
+                size -= dp[size-1];
+                rtp.pad = 0;
+            }
+
+            if(size <= 0) {
+                t_print("size <= 0\n");
+                continue;
+            }
+
+            rcb->mdp = dp;
+            rcb->mbufferLen = size;
+            rcb->mbufferOffset = 0;
+        }
+    }
+    return nRead;
+}
+#endif
+
+uint64_t get_posix_clock_time_us()
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
+        return (uint64_t)(ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
+    } else {
+        return 0; // Error handling
+    }
+}
+
+void sdr_sighandler (int signum)
+{
+    t_print ("Signal caught, exiting!\n");
+    do_exit = 1;
+    running = 0;
+    usleep(700000);
+}
+
+char *time_stamp ()
+{
+    char *timestamp = (char *) malloc (sizeof (char) * 16);
+    time_t ltime = time (NULL);
+    struct tm *tm;
+
+    tm = localtime (&ltime);
+    sprintf (timestamp, "%02d:%02d:%02d", tm->tm_hour, tm->tm_min, tm->tm_sec);
+    return timestamp;
+}
+
+void *hpsdrsim_sendiq_thr_func (void *arg)
+{
+    int samps_packet = 238;
+    ssize_t num_samps = 0;
+    struct rcvr_cb *rcb = (struct rcvr_cb *) arg;
+    int count = 512;
+    float data_buffer[2048];
+
+    rcb->iqSample_offset = rcb->iqSamples_remaining = 0;
+    rcb->err_count = 0;
+    t_print("Starting hpsdrsim_sendiq_thr_func() rcvr %d...\n", rcb->rcvr_num);
+
+#ifdef USE_INSTALLED_TOOLS
+    char command[256];
+    bool init = true;
+    FILE *fp = NULL;
+    sprintf (command, "tune -s %d -e float %s 2>&1 > /dev/null", rcb->ssrc, mcb.control_maddr);
+    run_cmd(command);
+
+    sprintf(command, "pcmrecord --stdout --ssrc %d -r %s", rcb->ssrc, mcb.data_maddr);
+    while (!do_exit) {
+        if (!ddcenable[rcb->rcvr_num]) {
+            init = true;
+            usleep(500000);
+            continue;
+        } else if (init) {
+            // Open a pipe to the command
+            if ((fp = popen(command, "r")) == NULL) {
+                t_perror("Error opening pipe");
+                exit(0);
+            }
+            init = false;
+        }
+        num_samps = fread(data_buffer, sizeof(float), count, fp);
+        if (num_samps != count) continue;
+        num_samps = count/2;
+#else
+    setupStream(rcb);
+    while (!do_exit) {
+        if (!ddcenable[rcb->rcvr_num]) {
+            usleep(500000);
+            continue;
+        }
+        num_samps = readStream(data_buffer, count, rcb);
+        if (num_samps != count) continue;
+        num_samps = count;
+#endif
+
+        for (int i = 0; i < num_samps; ++i) {
+            float real = data_buffer[2*i] * rcb->scale;
+            float imag = data_buffer[2*i+1] * rcb->scale;
+            rcb->iqSamples[rcb->iqSamples_remaining + i] = (real + imag*_Complex_I);
+        }
+
+        // can happen when switching between rcvr numbers
+        if (rcb->iqSamples_remaining < 0)
+            rcb->iqSamples_remaining = 0;
+
+        rcb->iqSamples_remaining += num_samps;
+
+        while (rcb->iqSamples_remaining > samps_packet) {
+            load_packet(rcb);
+            rcb->iqSamples_remaining -= samps_packet;
+            rcb->iqSample_offset += samps_packet;
+        }
+
+        // move remaining samples to beginning of buffer
+        if ((rcb->iqSample_offset > 0) && (rcb->iqSamples_remaining > 0)) {
+            memcpy (&(rcb->iqSamples[0]),
+                    &(rcb->iqSamples[rcb->iqSample_offset]),
+                    rcb->iqSamples_remaining * sizeof (float complex));
+            rcb->iqSample_offset = 0;
+        }
+    }
+
+    t_print("Ending hpsdrsim_sendiq_thr_func() rcvr %d.\n", rcb->rcvr_num);
+    pthread_exit (NULL);
+}
+
+int main (int argc, char *argv[])
+{
+    int count = 0;
+    uint8_t id[4] = { 0xef, 0xfe, 1, 6 };
+    struct sockaddr_in addr_udp;
+    struct sockaddr_in addr_from;
+    socklen_t lenaddr;
+    struct timeval tv;
+    int yes = 1;
+    int bytes_read;
+    uint32_t i, code;
+    u_char buffer[MAX_BUFFER_LEN];
+    uint32_t *code0;
+    const int MAC1 = 0x00; //RRK?
+    const int MAC2 = 0x1C;
+    const int MAC3 = 0xC0;
+    const int MAC4 = 0xA2;
+    const int MAC5 = 0x10;
+    const int MAC6 = 0xDD;
+    int CmdOption;
+    struct sigaction sigact;
+
+    code0 = (uint32_t *) buffer;
+    memset(&mcb, 0, sizeof(mcb));
+    // set defaults
+    mcb.gain = 60;
+    mcb.att = 0;
+    mcb.num_rxs = MAX_RCVRS;
+    mcb.wideband = false;
+    strcpy(mcb.data_maddr, "hf-iq.local");
+    strcpy(mcb.control_maddr, "hf.local");
+
+    while((CmdOption = getopt(argc, argv, "a:c:d:g:n:hw:")) != -1) {
+        switch(CmdOption) {
+        case 'h':
+            printf("Usage: %s <optional arguments>\n", basename(argv[0]));
+            printf("optional arguments:\n");
+            printf("-a attenuation in 1/10's dB (default 0))\n");
+            printf("-d data maddr (default hf-iq.local)\n");
+            printf("-c control maddr (default hf.local))\n");
+            printf("-g tuner gain in 1/10's dB (default 60))\n");
+            printf("-h help (prints this usage)\n");
+            printf("-n number of receiver slices (defaults to 8 max)\n");
+            printf("-w enable wideband 0/1 (default is 0, disabled)\n");
+            return EXIT_SUCCESS;
+            break;
+
+        case 'a':
+            mcb.att = atoi (optarg);
+            break;
+        case 'c':
+            strcpy (mcb.control_maddr, optarg);
+            break;
+        case 'd':
+            strcpy (mcb.data_maddr, optarg);
+            break;
+        case 'g':
+            mcb.gain = atoi (optarg);
+            break;
+        case 'n':
+            mcb.num_rxs = atoi (optarg);
+            break;
+        case 'w':
+            mcb.wideband = atoi (optarg);
+            break;
+        }
+    }
+    printf("\n");
+
+    if ((sock_udp = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
+        t_perror("socket");
+        return EXIT_FAILURE;
+    }
+
+    setsockopt(sock_udp, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+    setsockopt(sock_udp, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
+    tv.tv_sec = 0;
+    tv.tv_usec = 1000;
+    setsockopt(sock_udp, SOL_SOCKET, SO_RCVTIMEO, (void *)&tv, sizeof(tv));
+    memset(&addr_udp, 0, sizeof(addr_udp));
+    addr_udp.sin_family = AF_INET;
+    addr_udp.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr_udp.sin_port = htons(1024);
+
+    if (bind(sock_udp, (struct sockaddr *)&addr_udp, sizeof(addr_udp)) < 0) {
+        t_perror("main ERROR: bind");
+        return EXIT_FAILURE;
+    }
+
+    if (pthread_create(&highprio_thread_id, NULL, highprio_thread, NULL) < 0) {
+        t_perror("***** ERROR: Create HighPrio thread");
+    }
+
+    if (pthread_create(&ddc_specific_thread_id, NULL, ddc_specific_thread, NULL) < 0) {
+        t_perror("***** ERROR: Create DDC specific thread");
+    }
+
+    if (pthread_create(&mic_thread_id, NULL, mic_thread, NULL) < 0) {
+        t_perror("***** ERROR: Create MIC thread");
+    }
+
+    if (mcb.wideband) {
+        if (pthread_create(&wb_thread_id, NULL, wb_thread, NULL) < 0) {
+            t_perror("***** ERROR: Create WB thread");
+        }
+    }
+
+    sigact.sa_handler = sdr_sighandler;
+    sigemptyset (&sigact.sa_mask);
+    sigact.sa_flags = 0;
+    sigaction (SIGINT, &sigact, NULL);
+    sigaction (SIGTERM, &sigact, NULL);
+    sigaction (SIGQUIT, &sigact, NULL);
+    sigaction (SIGPIPE, &sigact, NULL);
+
+    pthread_mutex_init (&send_lock, NULL);
+    pthread_cond_init (&send_cond, NULL);
+    pthread_mutex_init (&done_send_lock, NULL);
+    pthread_cond_init (&done_send_cond, NULL);
+
+    for (i = 0; i < mcb.num_rxs; i++) {
+        mcb.rcb[i].mcb = &mcb;
+        mcb.rcb[i].new_freq = 0;
+        mcb.rcb[i].output_rate = 192000;
+        mcb.rcb[i].ssrc = i + 1;
+        mcb.rcb[i].scale = 700.0f;
+        mcb.rcb[i].curr_freq = 10000000;
+        memset (&mcb.freq_ltime[i], 0, sizeof (mcb.freq_ltime[i]));
+
+        mcb.rcb[i].rcvr_num = i;
+        mcb.rcvrs_mask |= 1 << i;
+        mcb.rcb[i].rcvr_mask = 1 << i;
+        // this sets up the mcast stream so fire it off before starting the rx's
+        if (pthread_create(&hpsdrsim_sendiq_thr_id[i], NULL, hpsdrsim_sendiq_thr_func, &mcb.rcb[i]) < 0) {
+            t_perror("***** ERROR: Create hpsdrsim_sendiq_thr");
+        }
+    }
+
+    t_print("Waiting on Discovery...\n");
+
+    while (!do_exit) {
+        memcpy(buffer, id, 4);
+        count++;
+        lenaddr = sizeof(addr_from);
+        bytes_read = recvfrom(sock_udp, buffer, HPSDR_FRAME_LEN, 0, (struct sockaddr *)&addr_from, &lenaddr);
+
+        if (bytes_read < 0 && errno != EAGAIN) {
+            t_perror("recvfrom");
+            continue;
+        }
+
+        if (bytes_read <= 0) {
+            continue;
+        }
+
+        count = 0;
+        code = *code0;
+
+        /*
+         * Here we have to handle the following "non standard" cases:
+         * NewProtocol "Discovery" packet   60 bytes starting with 00 00 00 00 02
+         * NewProtocol "General"   packet   60 bytes starting with 00 00 00 00 00
+         *                                  ==> this starts NewProtocol radio
+         */
+        if (code == 0 && buffer[4] == 0x02) {
+            t_print("NewProtocol discovery packet received from %s\n", inet_ntoa(addr_from.sin_addr));
+            // prepare response
+            memset(buffer, 0, 60);
+            buffer [4] = 0x02 + running;
+            buffer [5] = MAC1;
+            buffer[ 6] = MAC2;
+            buffer[ 7] = MAC3;
+            buffer[ 8] = MAC4;
+            buffer[ 9] = MAC5;
+            buffer[10] = MAC6;
+            buffer[11] = HERMES;
+            buffer[12] = 38;
+            buffer[13] = 18;
+            buffer[20] = mcb.num_rxs;
+            buffer[21] = 1;
+            buffer[22] = 3;
+
+            sendto(sock_udp, buffer, 60, 0, (struct sockaddr *)&addr_from, sizeof(addr_from));
+            continue;
+        }
+
+        if (bytes_read == 60 && buffer[4] == 0x00) {
+            // handle "general packet" of the new protocol
+            memset(&addr_new, 0, sizeof(addr_new));
+            addr_new.sin_family = AF_INET;
+            addr_new.sin_addr.s_addr = addr_from.sin_addr.s_addr;
+            addr_new.sin_port = addr_from.sin_port;
+            new_protocol_general_packet(buffer);
+            continue;
+        }
+    }
+
+    close(sock_udp);
+
+    return EXIT_SUCCESS;
+}
+
+void t_print(const char *format, ...)
+{
+    va_list(args);
+    va_start(args, format);
+    struct timespec ts;
+    double now;
+    static double starttime;
+    static int first = 1;
+    char line[1024];
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    now = ts.tv_sec + 1E-9 * ts.tv_nsec;
+
+    if (first) {
+        first = 0;
+        starttime = now;
+    }
+
+    //
+    // After 11 days, the time reaches 999999.999 so we simply wrap around
+    //
+    if (now - starttime >= 999999.995) {
+        starttime += 1000000.0;
+    }
+
+    //
+    // We have to use vsnt_print to handle the varargs stuff
+    // g_print() seems to be thread-safe but call it only ONCE.
+    //
+    vsnprintf(line, 1024, format, args);
+    printf("%10.6f %s", now - starttime, line);
+}
+
+void t_perror(const char *string)
+{
+    t_print("%s: %s\n", string, strerror(errno));
+}
+
+void load_packet (struct rcvr_cb *rcb)
+{
+    float complex *out_buf = &rcb->iqSamples[rcb->iqSample_offset];
+    int i, j, IQData;
+    int k = rcb->rcvr_num;
+
+    pthread_mutex_lock (&done_send_lock);
+    while (!(done_send_flags & rcb->rcvr_mask) && running) {
+        pthread_cond_wait (&done_send_cond, &done_send_lock);
+    }
+    done_send_flags &= ~rcb->rcvr_mask;
+    pthread_mutex_unlock (&done_send_lock);
+
+    for (i = 0, j = 0; i < 238; i++, j+=6) {
+        IQData = (int)cimagf(out_buf[i]);
+        pbuf[k][j] = IQData >> 16;
+        pbuf[k][j+1] = IQData >> 8;
+        pbuf[k][j+2] = IQData & 0xff;
+        IQData = (int)crealf(out_buf[i]);
+        pbuf[k][j+3] = IQData >> 16;
+        pbuf[k][j+4] = IQData >> 8;
+        pbuf[k][j+5] = IQData & 0xff;
+    }
+
+    pthread_mutex_lock (&send_lock);
+    send_flags |= rcb->rcvr_mask;
+    pthread_cond_broadcast (&send_cond);
+    pthread_mutex_unlock (&send_lock);
+}
+
+void new_protocol_general_packet(unsigned char *buffer)
+{
+    static unsigned long seqnum = 0;
+    unsigned long seqold;
+    int rc;
+
+    gen_rcvd = true;
+
+    seqold = seqnum;
+    seqnum = (buffer[0] >> 24) + (buffer[1] << 16) + (buffer[2] << 8) + buffer[3];
+
+    if ((seqnum != 0 && seqnum != seqold + 1 ) && seqold != 0) {
+        t_print("GP: SEQ ERROR, old=%lu new=%lu\n", seqold, seqnum);
+    }
+
+    if (mcb.wideband) { //RRK need to update these in wb_thread
+        rc = buffer[23] & 1;
+        if (rc != wbenable) {
+            wbenable = rc;
+            t_print("GP: Wideband Enable Flag is %d\n", wbenable);
+        }
+
+        rc = (buffer[24] << 8) + buffer[25];
+        if (rc != wide_len) {
+            wide_len = rc;
+            t_print("GP: WideBand Length is %d\n", rc);
+        }
+
+        rc = buffer[26];
+        if (rc != wide_size) {
+            wide_size = rc;
+            t_print("GP: Wideband sample size is %d\n", rc);
+        }
+
+        rc = buffer[27];
+        if (rc != wide_rate) {
+            wide_rate = rc;
+            t_print("GP: Wideband sample rate is %d\n", rc);
+        }
+
+        rc = buffer[28];
+        if (rc != wide_ppf) {
+            wide_ppf = rc;
+            t_print("GP: Wideband PPF is %d\n", rc);
+        }
+    }
+}
+
+void *highprio_thread(void *data)
+{
+    struct sockaddr_in addr;
+    socklen_t lenaddr = sizeof(addr);
+    unsigned long seqnum = 0, seqold;
+    unsigned char hp_buffer[2000];
+    struct timeval tv;
+    int i, rc, yes = 1;
+    long freq;
+
+    hp_sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (hp_sock < 0) {
+        t_perror("***** ERROR: HP: socket");
+        return NULL;
+    }
+
+    setsockopt(hp_sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+    setsockopt(hp_sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
+    tv.tv_sec = 0;
+    tv.tv_usec = 10000;
+    setsockopt(hp_sock, SOL_SOCKET, SO_RCVTIMEO, (void *)&tv, sizeof(tv));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(hp_port);
+
+    if (bind(hp_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        t_perror("highprio_thread ERROR: bind");
+        close(hp_sock);
+        return NULL;
+    }
+
+    t_print("Starting highprio_thread()\n");
+    while (!do_exit) {
+        if (!running) seqnum = 0;
+
+        rc = recvfrom(hp_sock, hp_buffer, 1444, 0, (struct sockaddr *)&addr, &lenaddr);
+
+        if (rc < 0 && errno != EAGAIN) {
+            t_perror("***** ERROR: HighPrio thread: recvmsg");
+            break;
+        }
+
+        if (rc < 0) {
+            continue;
+        }
+
+        if (rc != 1444) {
+            t_print("Received HighPrio packet with incorrect length %d\n", rc);
+            break;
+        }
+
+        seqold = seqnum;
+        seqnum = (hp_buffer[0] >> 24) + (hp_buffer[1] << 16) + (hp_buffer[2] << 8) + hp_buffer[3];
+
+        if ((seqnum != 0 && seqnum != seqold + 1 ) && seqold != 0) {
+            t_print("HP: SEQ ERROR, old=%lu new=%lu\n", seqold, seqnum);
+        }
+
+        for (i = 0; i < mcb.num_rxs; i++) {
+            freq = (hp_buffer[ 9 + 4 * i] << 24) + (hp_buffer[10 + 4 * i] << 16) + (hp_buffer[11 + 4 * i] << 8) + hp_buffer[12 + 4 * i];
+
+            if (bits & 0x08) {
+                freq = round(122880000.0 * (double) freq / 4294967296.0);
+            }
+
+            if (freq != rxfreq[i]) {
+                mcb.rcb[i].new_freq = rxfreq[i] = freq;
+                //t_print("HP: DDC%d freq: %lu\n", i, freq);
+            }
+        }
+
+        rc = hp_buffer[5] & 0x01;
+        if (rc != adcdither) {
+            adcdither = rc;
+            //t_print("RX: ADC dither=%d\n", adcdither);
+        }
+
+        rc = hp_buffer[6] & 0x01;
+        if (rc != adcrandom) {
+            adcrandom = rc;
+            //t_print("RX: ADC random=%d\n", adcrandom);
+        }
+
+        rc = hp_buffer[1443];
+        if (rc != stepatt0) {
+            stepatt0 = rc;
+            //t_print("HP: StepAtt0 = %d\n", stepatt0);
+        }
+
+        rc = hp_buffer[4] & 0x01;
+        if (rc != running) {
+            running = rc;
+            t_print("HP: Running = %d\n", rc);
+            if (!running) {
+                for (i = 0; i < mcb.num_rxs; i++) {
+                    ddcenable[i] = 0;
+                    mcb.rcb[i].rcvr_mask = 0;
+                    rxrate[i] = 0;
+                    rxfreq[i] = 0;
+                }
+            } else {
+                for (i = 0; i < mcb.num_rxs; i++) {
+                    if (rx_thread_id[i] == 0) {
+                        if (pthread_create(&rx_thread_id[i], NULL, rx_thread, (void *) (uintptr_t) i) < 0) {
+                            t_perror("***** ERROR: Create RX thread");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    t_print("Ending highprio_thread()\n");
+    close(hp_sock);
+    return NULL;
+}
+
+void *ddc_specific_thread(void *data)
+{
+    int sock;
+    struct sockaddr_in addr;
+    socklen_t lenaddr = sizeof(addr);
+    unsigned long seqnum, seqold;
+    struct timeval tv;
+    unsigned char ddc_buffer[2000];
+    int yes = 1;
+    int rc;
+    int i;
+
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (sock < 0) {
+        t_perror("***** ERROR: ddc_specific_thread: socket");
+        return NULL;
+    }
+
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
+    tv.tv_sec = 0;
+    tv.tv_usec = 10000;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *)&tv, sizeof(tv));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(ddc_port);
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        t_perror("ddc_specific_thread ERROR: bind");
+        close(sock);
+        return NULL;
+    }
+
+    seqnum = 0;
+
+    t_print("Starting ddc_specific_thread()\n");
+    while (!do_exit) {
+        if (!running) seqnum = 0;
+
+        rc = recvfrom(sock, ddc_buffer, 1444, 0, (struct sockaddr *)&addr, &lenaddr);
+        if (rc < 0 && errno != EAGAIN) {
+            t_perror("***** ERROR: DDC specific thread: recvmsg");
+            break;
+        }
+
+        if (rc < 0) {
+            continue;
+        }
+
+        if (rc != 1444) {
+            t_print("RXspec: Received DDC specific packet with incorrect length");
+            break;
+        }
+
+        seqold = seqnum;
+        seqnum = (ddc_buffer[0] >> 24) + (ddc_buffer[1] << 16) + (ddc_buffer[2] << 8) + ddc_buffer[3];
+
+        if ((seqnum != 0 && seqnum != seqold + 1 ) && seqold != 0) {
+            t_print("RXspec: SEQ ERROR, old=%lu new=%lu\n", seqold, seqnum);
+        }
+
+        for (i = 0; i < mcb.num_rxs; i++) {
+            int modified = 0;
+            struct rcvr_cb *rcb = &mcb.rcb[i];
+
+            rc = (ddc_buffer[18 + 6 * i] << 8) + ddc_buffer[19 + 6 * i];
+            if (rc != rxrate[i] && rc != 0) {
+                rxrate[i] = rc;
+                mcb.rcb[i].output_rate = (rxrate[i] * 1000);
+                modified = 1;
+
+                switch(rxrate[i]) {
+                case 48:
+                    mcb.rcb[i].scale = 8000.0f;
+                    break;
+                case 96:
+                    mcb.rcb[i].scale = 6000.0f;
+                    break;
+                case 192:
+                    mcb.rcb[i].scale = 4000.0f;
+                    break;
+                case 384:
+                    mcb.rcb[i].scale = 3000.0f;
+                    break;
+                case 768:
+                    mcb.rcb[i].scale = 1700.0f;
+                    break;
+                case 1536:
+                    mcb.rcb[i].scale = 1000.0f;
+                }
+
+#ifdef USE_INSTALLED_TOOLS
+                char scommand[256];
+                sprintf (scommand, "tune -s %d -R %d -L %d -H %d --rfatten %d -g %d %s 2>&1 > /dev/null",
+                         rcb->ssrc, rcb->output_rate+((rxrate[i] > 192)?100:0), (int)(rcb->output_rate * -0.49),
+                         (int)(rcb->output_rate * 0.49), mcb.att, mcb.gain, mcb.control_maddr);
+                run_cmd(scommand);
+#else
+                setSampleRate(rcb);
+#endif
+            }
+
+            rc = (ddc_buffer[7 + (i / 8)] >> (i % 8)) & 0x01;
+            if (rc != ddcenable[i]) {
+                modified = 1;
+                ddcenable[i] = rc;
+                mcb.rcb[i].rcvr_mask = 1 << i;
+                if (ddcenable[i]) {
+                    pthread_mutex_lock (&send_lock);
+                    send_flags |= 1 << i;
+                    pthread_cond_broadcast (&send_cond);
+                    pthread_mutex_unlock (&send_lock);
+                }
+            }
+
+            if (modified) {
+                t_print("RX: DDC%d Enable=%d Rate=%d\n", i, ddcenable[i], rxrate[i]);
+                rc = 0;
+            }
+        }
+    }
+
+    close(sock);
+    ddc_specific_thread_id = 0;
+    t_print("Ending ddc_specific_thread()\n");
+    return NULL;
+}
+
+void *rx_thread(void *data)
+{
+    // One instance of this thread is started for each DDC
+    int sock;
+    struct sockaddr_in addr;
+    unsigned long seqnum;
+    unsigned char rx_buffer[1444];
+    int myddc;
+    int yes = 1;
+    unsigned char *p;
+    double now, last = 0;
+    struct rcvr_cb *rcb;
+
+    myddc = (int) (uintptr_t) data;
+    rcb = &mcb.rcb[myddc];
+
+    if (myddc < 0 || myddc >= mcb.num_rxs) {
+        return NULL;
+    }
+
+    seqnum = 0;
+
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        t_perror("***** ERROR: RXthread: socket");
+        return NULL;
+    }
+
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(ddc0_port + myddc);
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        t_perror("rx_thread ERROR: bind");
+        close(sock);
+        return NULL;
+    }
+
+    t_print("Starting rx_thread (%d)\n", myddc);
+    while (!do_exit) {
+        if (!gen_rcvd || ddcenable[myddc] <= 0 || rxrate[myddc] == 0 || rxfreq[myddc] == 0) {
+            usleep(500000);
+            seqnum = 0;
+            continue;
+        }
+
+        p = rx_buffer;
+        *(uint32_t*)p = htonl(seqnum++);
+        p += 4;
+
+        // no time stamps
+        p += 9;
+
+        *p++ = 24; // bits per sample
+        *p++ = 0;
+        *p++ = 238; // samps per packet
+
+        pthread_mutex_lock (&send_lock);
+
+        while (!(send_flags & rcb->rcvr_mask) && running) {
+            pthread_cond_wait (&send_cond, &send_lock);
+        }
+        send_flags &= ~rcb->rcvr_mask;
+        pthread_mutex_unlock (&send_lock);
+
+        memcpy(p, &pbuf[myddc][0], 1428); // I-Q data
+
+#if 0  // for debug
+        if (seqnum > 1000 && myddc == 1) {
+            t_print ("rcvrs_mask:%x send_flags:%d\n", mcb.rcvrs_mask, send_flags);
+
+            for (int i = 0; i < 1444; i++) {
+                printf("%4d:%2x ", i, rx_buffer[i]);
+
+                if (!((i + 1) % 8))
+                    printf("\n");
+            }
+            //exit(0);
+        }
+#endif
+
+        if (sendto(sock, rx_buffer, 1444, 0, (struct sockaddr * )&addr_new, sizeof(addr_new)) < 0) {
+            t_perror("***** ERROR: RX thread sendto");
+            break;
+        }
+
+        pthread_mutex_lock (&done_send_lock);
+        done_send_flags |= rcb->rcvr_mask;
+        pthread_cond_broadcast (&done_send_cond);
+        pthread_mutex_unlock (&done_send_lock);
+
+        // limit freq change to once per 1ms
+        if (rcb->new_freq) {
+            clock_gettime(CLOCK_REALTIME, &mcb.freq_ttime[rcb->rcvr_num]);
+            now = mcb.freq_ttime[rcb->rcvr_num].tv_sec + 1.0E-9 * mcb.freq_ttime[rcb->rcvr_num].tv_nsec;
+            last = mcb.freq_ltime[rcb->rcvr_num].tv_sec + 1.0E-9 * mcb.freq_ltime[rcb->rcvr_num].tv_nsec;
+            if (seqnum < 1000 || (now - last) > 0.0001f) {
+#ifdef USE_INSTALLED_TOOLS
+                char fcommand[256];
+                sprintf (fcommand, "tune --ssrc %d -f %d %s 2>&1 > /dev/null",
+                         rcb->ssrc, rcb->new_freq, mcb.control_maddr);
+                run_cmd(fcommand);
+#else
+                setFrequency(rcb);
+#endif
+                rcb->curr_freq = rcb->new_freq;
+                rcb->new_freq = 0;
+                memcpy(&mcb.freq_ltime, &mcb.freq_ttime, sizeof(mcb.freq_ttime));
+            }
+        }
+    }
+
+    close(sock);
+    t_print("Ending rx_thread (%d)\n", myddc);
+    rx_thread_id[myddc] = 0;
+    ddcenable[myddc] = 0;
+    return NULL;
+}
+
+#define BIN_SAMPLE_CNT 32768
+
+void *wb_thread(void *data)
+{
+    // NOTE: this thread reuses the hp_sock socket since two sockets
+    //       can't send/recv on the same port/address (1027)
+    unsigned long seqnum = 0;
+    unsigned char wb_buffer[1028];
+    uint8_t samples[BIN_SAMPLE_CNT];
+    unsigned char *p;
+    int i, j;
+    FILE *bfile;
+    char *filename = "/dev/shm/rx888wb.bin";
+    size_t bytes_read;
+
+    t_print("Starting wb_thread\n");
+    while (!do_exit) {
+        if (!gen_rcvd || !running || !wbenable) {
+            usleep(50000);
+            continue;
+        }
+
+        bfile = fopen(filename, "rb");
+        if (bfile != NULL) {
+            bytes_read = fread(samples, 1, BIN_SAMPLE_CNT, bfile);
+            if (bytes_read != 32768) {
+                //t_print("%s, bytes_read:%ld bytes_wanted:%d\n",
+                //       __FUNCTION__, bytes_read, BIN_SAMPLE_CNT);
+                fclose(bfile);
+                continue; // skip it and continue
+            }
+            seqnum = 0; // reset per frame
+            fclose(bfile);
+
+            // frame
+            for (i = 0; i < 32; i++) {
+                // update seq number
+                p = wb_buffer;
+                *(uint32_t*)p = htonl(seqnum++);
+                p += 4;
+
+                // packet
+                for (j = 0; j < 1024; j+=2) { //swap bytes
+                    wb_buffer[j+5] = samples[j + (i * 1024)];
+                    wb_buffer[j+4] = samples[j + 1 + (i * 1024)];
+                }
+
+                if (sendto(hp_sock, wb_buffer, 1028, 0,
+                           (struct sockaddr * )&addr_new, sizeof(addr_new)) < 0) {
+                    t_perror("***** ERROR: WB thread sendto");
+                    break;
+                }
+            }
+            usleep(66000);
+        } else {
+            t_print("%s() filename: %s does not exist\n", __FUNCTION__, filename);
+            break;
+        }
+    }
+
+    t_print("Ending wb_thread\n");
+    return NULL;
+}
+
+//
+// The microphone thread just sends silence, that is
+// a "zeroed" mic frame every 1.333 msec and needs to
+// be sent for some app's timing purposes.
+//
+void *mic_thread(void *data)
+{
+    int sock;
+    unsigned long seqnum = 0;
+    struct sockaddr_in addr;
+    unsigned char mic_buffer[132];
+    unsigned char *p;
+    int yes = 1;
+    struct timespec delay;
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (sock < 0) {
+        t_perror("***** ERROR: Mic thread: socket");
+        return NULL;
+    }
+
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(mic_port);
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        t_perror("mic_thread ERROR: bind");
+        close(sock);
+        return NULL;
+    }
+
+    memset(mic_buffer, 0, 132);
+    clock_gettime(CLOCK_MONOTONIC, &delay);
+
+    t_print("Starting mic_thread\n");
+    while (!do_exit) {
+        if (!gen_rcvd || !running) {
+            usleep(500000);
+            seqnum = 0;
+            continue;
+        }
+        // update seq number
+        p = mic_buffer;
+        *(uint32_t*)p = htonl(seqnum++);
+        p += 4;
+
+#if 1
+        // 64 samples with 48000 kHz, makes 1333333 nsec
+        delay.tv_nsec += 1333333;
+
+        while (delay.tv_nsec >= 1000000000) {
+            delay.tv_nsec -= 1000000000;
+            delay.tv_sec++;
+        }
+
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &delay, NULL);
+#else
+        usleep(1333);
+#endif
+
+        if (sendto(sock, mic_buffer, 132, 0, (struct sockaddr * )&addr_new, sizeof(addr_new)) < 0) {
+            t_perror("***** ERROR: Mic thread sendto");
+            break;
+        }
+    }
+
+    t_print("Ending mic_thread\n");
+    close(sock);
+    return NULL;
+}
