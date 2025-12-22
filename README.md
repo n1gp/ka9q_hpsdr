@@ -40,17 +40,14 @@ cat ../ka9q_hpsdr/ka9q-radio_wideband.patch | patch -p1
 
 make; make install
 
-I've been using the built-in tool 'tune' and 'pcmrecord --stdout' and executing
-them in code from posix spawn, but recently I put in code to control and grab the
-IQ data using sockets. It seems to be stable now but you can also build for using
-the older method by:
-
-make USE_INSTALLED_TOOLS=1
+If you can suggest improvements or find bugs please post something to the Issues
+tab on https://github.com/n1gp/ka9q_hpsdr
 
 Issues:
 Rarely I have seen that when initializing the channel, the high and low filters
 get set to 5KHz and -5KHz. I'm guessing that the control packet with the proper
 settings didn't make it to ka9q-radio.
 
-If you can suggest improvements or find bugs please post something to the Issues
-tab on https://github.com/n1gp/ka9q_hpsdr
+When switching sample rates there may be no data coming from pcmrecord for a few
+seconds or more, or not at all if the rate is above 192k unless I add 100 Hz.
+I'm not sure where the problem lies.

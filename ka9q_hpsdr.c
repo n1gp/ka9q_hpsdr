@@ -57,9 +57,9 @@ static struct sockaddr_in addr_new;
 
 // protocol2 stuff
 static int bits = -1;
-static long rxfreq[MAX_RCVRS];
-static int ddcenable[MAX_RCVRS];
-static int rxrate[MAX_RCVRS];
+static long rxfreq[MAX_RCVRS] = {0,};
+static int ddcenable[MAX_RCVRS] = {0,};
+static int rxrate[MAX_RCVRS] = {0,};
 static int adcdither = -1;
 static int adcrandom = -1;
 static int stepatt0 = -1;
@@ -137,6 +137,8 @@ int setupStream(struct rcvr_cb *rcb)
         t_print("connect_mcast failed\n");
     }
 
+    t_print("%s(), rx:%d\n", __FUNCTION__, rcb->rcvr_num);
+
     uint8_t cmd_buffer[PKTSIZE];
     uint8_t *bp = cmd_buffer;
     *bp++ = 1; // Generate command packet
@@ -189,10 +191,9 @@ void setFrequency(struct rcvr_cb *rcb)
     uint32_t sent_tag = arc4random();
     encode_int(&bp, COMMAND_TAG, sent_tag);
     encode_int(&bp, OUTPUT_SSRC, rcb->ssrc);
-    encode_double(&bp, RADIO_FREQUENCY, (double)rcb->new_freq);
-    //encode_double(&bp, RADIO_FREQUENCY, (double)(rcb->new_freq*10+4611000));
+    encode_double(&bp, RADIO_FREQUENCY, (double)rcb->curr_freq);
     encode_eol(&bp);
-    t_print("%s(), rx:%d frequency:%d\n", __FUNCTION__, rcb->rcvr_num, rcb->new_freq);
+    t_print("%s(), rx:%d frequency:%d\n", __FUNCTION__, rcb->rcvr_num, rcb->curr_freq);
 
     int cmd_len = bp - cmd_buffer;
     sendCommand(cmd_buffer, cmd_len, rcb);
@@ -349,8 +350,9 @@ void *hpsdrsim_sendiq_thr_func (void *arg)
         num_samps = count/2;
 #else
     setupStream(rcb);
+    usleep(500000);
     while (!do_exit) {
-        if (!ddcenable[rcb->rcvr_num]) {
+        if (!gen_rcvd || ddcenable[rcb->rcvr_num] <= 0 || rxfreq[rcb->rcvr_num] == 0) {
             usleep(500000);
             continue;
         }
@@ -513,10 +515,10 @@ int main (int argc, char *argv[])
     for (i = 0; i < mcb.num_rxs; i++) {
         mcb.rcb[i].mcb = &mcb;
         mcb.rcb[i].new_freq = 0;
+        mcb.rcb[i].curr_freq = 10000000;
         mcb.rcb[i].output_rate = 192000;
         mcb.rcb[i].ssrc = i + 1;
         mcb.rcb[i].scale = 700.0f;
-        mcb.rcb[i].curr_freq = 10000000;
         memset (&mcb.freq_ltime[i], 0, sizeof (mcb.freq_ltime[i]));
 
         mcb.rcb[i].rcvr_num = i;
@@ -1056,6 +1058,7 @@ void *rx_thread(void *data)
             now = mcb.freq_ttime[rcb->rcvr_num].tv_sec + 1.0E-9 * mcb.freq_ttime[rcb->rcvr_num].tv_nsec;
             last = mcb.freq_ltime[rcb->rcvr_num].tv_sec + 1.0E-9 * mcb.freq_ltime[rcb->rcvr_num].tv_nsec;
             if (seqnum < 1000 || (now - last) > 0.0001f) {
+                rcb->curr_freq = rcb->new_freq;
 #ifdef USE_INSTALLED_TOOLS
                 char fcommand[256];
                 sprintf (fcommand, "tune --ssrc %d -f %d %s 2>&1 > /dev/null",
@@ -1064,7 +1067,6 @@ void *rx_thread(void *data)
 #else
                 setFrequency(rcb);
 #endif
-                rcb->curr_freq = rcb->new_freq;
                 rcb->new_freq = 0;
                 memcpy(&mcb.freq_ltime, &mcb.freq_ttime, sizeof(mcb.freq_ttime));
             }
