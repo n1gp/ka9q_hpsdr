@@ -11,11 +11,16 @@ that can handle multiple receiver slices for skimming cw, ft8, and other modes.
 
 Examples:
 
-https://www.sparksdr.com/
-https://www.dxatlas.com/SkimServer/
-https://www.dxatlas.com/RttySkimServ/
+https://www.sparksdr.com
+
+https://www.dxatlas.com/SkimServer
+
+https://www.dxatlas.com/RttySkimServ
+
 https://github.com/g0orx/linhpsdr
+
 https://github.com/ramdor/Thetis/releases
+
 https://github.com/dl1ycf/pihpsdr
 
 A sample configuration file 'radiod@rx888-hf.conf' is included for an RX888.
@@ -30,7 +35,9 @@ wideband spectrum for HPSDR programs which implement it. It would be much
 better to send it in multicast once I figure out how to do that.
 
 cd ../ka9q-radio
+
 cat ../ka9q_hpsdr/ka9q-radio_wideband.patch | patch -p1
+
 make; make install
 
 I've been using the built-in tool 'tune' and 'pcmrecord --stdout' and executing
