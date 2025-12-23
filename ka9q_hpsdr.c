@@ -328,7 +328,7 @@ void *hpsdrsim_sendiq_thr_func (void *arg)
     char command[256];
     bool init = true;
     FILE *fp = NULL;
-    sprintf (command, "tune -s %d -e float %s 2>&1 > /dev/null", rcb->ssrc, mcb.control_maddr);
+    sprintf (command, "tune -s %d -m iq -e float %s 2>&1 > /dev/null", rcb->ssrc, mcb.control_maddr);
     run_cmd(command);
 
     sprintf(command, "pcmrecord --stdout --ssrc %d -r %s", rcb->ssrc, mcb.data_maddr);
