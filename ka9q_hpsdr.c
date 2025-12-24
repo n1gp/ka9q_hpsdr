@@ -130,14 +130,12 @@ int setupStream(struct rcvr_cb *rcb)
         t_print("listen_mcast failed\n");
     }
 
-    int Mcast_ttl = 0; //RRK was 1
+    int Mcast_ttl = 0;
     int IP_tos = 0;
     rcb->mControl_sock = connect_mcast(&Control_address, iface, Mcast_ttl, IP_tos);
     if (rcb->mControl_sock == -1) {
         t_print("connect_mcast failed\n");
     }
-
-    t_print("%s(), rx:%d\n", __FUNCTION__, rcb->rcvr_num);
 
     uint8_t cmd_buffer[PKTSIZE];
     uint8_t *bp = cmd_buffer;
@@ -148,6 +146,8 @@ int setupStream(struct rcvr_cb *rcb)
     const char *Mode = "iq";
     encode_string(&bp, PRESET, Mode, strlen(Mode));
     encode_eol(&bp);
+
+    t_print("%s(), rx:%d mode:%s\n", __FUNCTION__, rcb->rcvr_num, Mode);
 
     int cmd_len = bp - cmd_buffer;
     sendCommand(cmd_buffer, cmd_len, rcb);
@@ -185,6 +185,7 @@ void closeStream(struct rcvr_cb *rcb)
 
 void setFrequency(struct rcvr_cb *rcb)
 {
+    int rate = rcb->output_rate;
     uint8_t cmd_buffer[PKTSIZE];
     uint8_t *bp = cmd_buffer;
     *bp++ = 1; // Generate command packet
@@ -192,6 +193,12 @@ void setFrequency(struct rcvr_cb *rcb)
     encode_int(&bp, COMMAND_TAG, sent_tag);
     encode_int(&bp, OUTPUT_SSRC, rcb->ssrc);
     encode_double(&bp, RADIO_FREQUENCY, (double)rcb->curr_freq);
+    // resend mode and rate with new freq
+    const char *Mode = "iq";
+    encode_string(&bp, PRESET, Mode, strlen(Mode));
+    encode_int(&bp, OUTPUT_SAMPRATE, (rate>192000)?rate+100:rate);
+    encode_float(&bp, LOW_EDGE, (int)(rate * -0.49));
+    encode_float(&bp, HIGH_EDGE, (int)(rate * 0.49));
     encode_eol(&bp);
     t_print("%s(), rx:%d frequency:%d\n", __FUNCTION__, rcb->rcvr_num, rcb->curr_freq);
 
@@ -219,8 +226,11 @@ void setSampleRate(struct rcvr_cb *rcb)
     encode_float(&bp, GAIN, (float)mcb.gain);
     encode_float(&bp, RF_ATTEN, (float)mcb.att);
     encode_int(&bp, AGC_ENABLE, false);
-    // encode_int(&bp, AGC_ENABLE, true);
     encode_int(&bp, OUTPUT_ENCODING, Encoding);
+    // resend mode and freq with new rate
+    const char *Mode = "iq";
+    encode_string(&bp, PRESET, Mode, strlen(Mode));
+    encode_double(&bp, RADIO_FREQUENCY, (double)rcb->curr_freq);
     encode_eol(&bp);
     t_print("%s(), rx:%d rate:%d Lfilt:%.1lf Hfilt:%.1lf Attn:%.1d Gain:%.1d\n", __FUNCTION__,
             rcb->rcvr_num, rate, rate * -0.49, rate * 0.49, mcb.att, mcb.gain);
@@ -326,8 +336,8 @@ void *hpsdrsim_sendiq_thr_func (void *arg)
 
 #ifdef USE_INSTALLED_TOOLS
     char command[256];
-    bool init = true;
     FILE *fp = NULL;
+    bool init = true;
     sprintf (command, "tune -s %d -m iq -e float %s 2>&1 > /dev/null", rcb->ssrc, mcb.control_maddr);
     run_cmd(command);
 
@@ -350,12 +360,12 @@ void *hpsdrsim_sendiq_thr_func (void *arg)
         num_samps = count/2;
 #else
     setupStream(rcb);
-    usleep(500000);
     while (!do_exit) {
-        if (!gen_rcvd || ddcenable[rcb->rcvr_num] <= 0 || rxfreq[rcb->rcvr_num] == 0) {
+        if (!ddcenable[rcb->rcvr_num]) {
             usleep(500000);
             continue;
         }
+
         num_samps = readStream(data_buffer, count, rcb);
         if (num_samps != count) continue;
         num_samps = count;
@@ -405,7 +415,7 @@ int main (int argc, char *argv[])
     uint32_t i, code;
     u_char buffer[MAX_BUFFER_LEN];
     uint32_t *code0;
-    const int MAC1 = 0x00; //RRK?
+    const int MAC1 = 0x00;
     const int MAC2 = 0x1C;
     const int MAC3 = 0xC0;
     const int MAC4 = 0xA2;
@@ -519,7 +529,6 @@ int main (int argc, char *argv[])
         mcb.rcb[i].output_rate = 192000;
         mcb.rcb[i].ssrc = i + 1;
         mcb.rcb[i].scale = 700.0f;
-        memset (&mcb.freq_ltime[i], 0, sizeof (mcb.freq_ltime[i]));
 
         mcb.rcb[i].rcvr_num = i;
         mcb.rcvrs_mask |= 1 << i;
@@ -867,7 +876,11 @@ void *ddc_specific_thread(void *data)
 
     t_print("Starting ddc_specific_thread()\n");
     while (!do_exit) {
-        if (!running) seqnum = 0;
+        if (!running) {
+            seqnum = 0;
+            usleep(500000);
+            continue;
+	}
 
         rc = recvfrom(sock, ddc_buffer, 1444, 0, (struct sockaddr *)&addr, &lenaddr);
         if (rc < 0 && errno != EAGAIN) {
@@ -968,7 +981,6 @@ void *rx_thread(void *data)
     int myddc;
     int yes = 1;
     unsigned char *p;
-    double now, last = 0;
     struct rcvr_cb *rcb;
 
     myddc = (int) (uintptr_t) data;
@@ -1052,24 +1064,17 @@ void *rx_thread(void *data)
         pthread_cond_broadcast (&done_send_cond);
         pthread_mutex_unlock (&done_send_lock);
 
-        // limit freq change to once per 1ms
         if (rcb->new_freq) {
-            clock_gettime(CLOCK_REALTIME, &mcb.freq_ttime[rcb->rcvr_num]);
-            now = mcb.freq_ttime[rcb->rcvr_num].tv_sec + 1.0E-9 * mcb.freq_ttime[rcb->rcvr_num].tv_nsec;
-            last = mcb.freq_ltime[rcb->rcvr_num].tv_sec + 1.0E-9 * mcb.freq_ltime[rcb->rcvr_num].tv_nsec;
-            if (seqnum < 1000 || (now - last) > 0.0001f) {
-                rcb->curr_freq = rcb->new_freq;
+            rcb->curr_freq = rcb->new_freq;
 #ifdef USE_INSTALLED_TOOLS
-                char fcommand[256];
-                sprintf (fcommand, "tune --ssrc %d -f %d %s 2>&1 > /dev/null",
-                         rcb->ssrc, rcb->new_freq, mcb.control_maddr);
-                run_cmd(fcommand);
+            char fcommand[256];
+            sprintf (fcommand, "tune --ssrc %d -f %d %s 2>&1 > /dev/null",
+                     rcb->ssrc, rcb->new_freq, mcb.control_maddr);
+            run_cmd(fcommand);
 #else
-                setFrequency(rcb);
+            setFrequency(rcb);
 #endif
-                rcb->new_freq = 0;
-                memcpy(&mcb.freq_ltime, &mcb.freq_ttime, sizeof(mcb.freq_ttime));
-            }
+            rcb->new_freq = 0;
         }
     }
 

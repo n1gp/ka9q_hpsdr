@@ -79,9 +79,6 @@ struct main_cb {
     char data_maddr[128];
     char control_maddr[128];
 
-    struct timespec freq_ltime[MAX_RCVRS];
-    struct timespec freq_ttime[MAX_RCVRS];
-
     struct rcvr_cb {
         int rcvr_num;
         u_int err_count;
