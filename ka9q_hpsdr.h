@@ -47,13 +47,10 @@
 #include <netdb.h>
 #include <complex.h>
 #include <sys/wait.h>
+#include <spawn.h>
 
-#ifndef USE_INSTALLED_TOOLS
 #include "status.h"
 #include "radio.h"
-#else
-#include <spawn.h>
-#endif
 
 #define HERMES_FW_VER 18
 #define MAX_BUFFER_LEN 2048
@@ -94,15 +91,11 @@ struct main_cb {
         int iqSamples_remaining;
         float complex iqSamples[IQ_BUF_COUNT + IQ_FRAME_DATA_LEN * 2];
 
-#ifndef USE_INSTALLED_TOOLS
-        int mStatus_sock;
-        int mControl_sock;
         int mInput_fd;
         uint8_t mbuffer[PKTSIZE];
         uint8_t *mdp;
         int mbufferLen;
         int mbufferOffset;
-#endif
     } rcb[MAX_RCVRS];
 };
 

@@ -12,15 +12,8 @@ endif
 CC = gcc
 CFLAGS = -std=gnu11 -Wall -O3 -D_GNU_SOURCE=1
 
-# still working on using mcast sockets
-#USE_INSTALLED_TOOLS = 1
-
-ifdef USE_INSTALLED_TOOLS
-CFLAGS += -DUSE_INSTALLED_TOOLS=1
-else
 INCLUDES=-I$(KA9Q_RADIO_DIR)
 KA9Q_RADIO_OBJS=$(KA9Q_RADIO_DIR)/multicast.o $(KA9Q_RADIO_DIR)/status.o $(KA9Q_RADIO_DIR)/misc.o $(KA9Q_RADIO_DIR)/rtp.o
-endif
 
 LIBS = -lrt -lm -lpthread -lbsd
 
