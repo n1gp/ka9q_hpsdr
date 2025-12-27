@@ -84,16 +84,20 @@ extern int clock_nanosleep(clockid_t __clock_id, int __flags,
                            __const struct timespec *__req,
                            struct timespec *__rem);
 
-void run_cmd(char *cmd)
+void send_tune(struct rcvr_cb *rcb)
 {
     pid_t pid;
-    char cmdout[128];
-    char *argv[] = {"sh", "-c", cmdout, NULL};
+    char cmd[384];
+    char *argv[] = {"sh", "-c", cmd, NULL};
     int status;
 
-    strcpy(cmdout, cmd);
-    strcat(cmdout, " 2>&1 > /dev/null");
+    sprintf (cmd, "tune -s %d -f %d -m iq -e F32LE -R %d -L %d -H %d --rfatten %d -g %d %s",
+            rcb->ssrc, rcb->curr_freq, rcb->output_rate+((rxrate[rcb->rcvr_num] > 192)?100:0),
+            (int)(rcb->output_rate * -0.49), (int)(rcb->output_rate * 0.49),
+            mcb.att, mcb.gain, mcb.control_maddr);
+
     t_print("Command: %s\n", cmd);
+    strcat(cmd, " 2>&1 > /dev/null");
     status = posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ);
     if (status == 0) {
         //t_print("Child pid: %i\n", pid);
@@ -125,14 +129,6 @@ void setupStream(struct rcvr_cb *rcb)
     if (setsockopt(rcb->mInput_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         t_print("setsockopt() error\n");
     }
-}
-
-void closeStream(struct rcvr_cb *rcb)
-{
-    char command[256];
-    sprintf (command, "tune -s %d -f 0 %s", rcb->ssrc, mcb.control_maddr);
-    run_cmd(command);
-    rcb->mInput_fd = -1;
 }
 
 int readStream(float *buffs, const size_t numElems, struct rcvr_cb *rcb)
@@ -229,10 +225,7 @@ void *hpsdrsim_sendiq_thr_func (void *arg)
     rcb->err_count = 0;
     t_print("Starting hpsdrsim_sendiq_thr_func() rcvr %d...\n", rcb->rcvr_num);
 
-    char command[256];
-    sprintf (command, "tune -s %d -m iq -e F32LE %s", rcb->ssrc, mcb.control_maddr);
-    run_cmd(command);
-
+    send_tune(rcb);
     setupStream(rcb);
     while (!do_exit) {
         if (!ddcenable[rcb->rcvr_num]) {
@@ -803,11 +796,7 @@ void *ddc_specific_thread(void *data)
                     mcb.rcb[i].scale = 1000.0f;
                 }
 
-                char scommand[256];
-                sprintf (scommand, "tune -s %d -R %d -L %d -H %d --rfatten %d -g %d %s",
-                         rcb->ssrc, rcb->output_rate+((rxrate[i] > 192)?100:0), (int)(rcb->output_rate * -0.49),
-                         (int)(rcb->output_rate * 0.49), mcb.att, mcb.gain, mcb.control_maddr);
-                run_cmd(scommand);
+                send_tune(rcb);
             }
 
             rc = (ddc_buffer[7 + (i / 8)] >> (i % 8)) & 0x01;
@@ -931,9 +920,7 @@ void *rx_thread(void *data)
 
         if (rcb->new_freq) {
             rcb->curr_freq = rcb->new_freq;
-            char fcommand[256];
-            sprintf (fcommand, "tune -s %d -f %d %s", rcb->ssrc, rcb->new_freq, mcb.control_maddr);
-            run_cmd(fcommand);
+            send_tune(rcb);
             rcb->new_freq = 0;
         }
     }
