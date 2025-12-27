@@ -64,7 +64,6 @@ static int adcdither = -1;
 static int adcrandom = -1;
 static int stepatt0 = -1;
 static int ddc_port = 1025;
-static int mic_port = 1026;
 static int hp_port = 1027; // also wb_port
 static int ddc0_port = 1035;
 static unsigned char pbuf[MAX_RCVRS][238*6];
@@ -73,12 +72,10 @@ static int hp_sock;
 
 static pthread_t highprio_thread_id = 0;
 static pthread_t ddc_specific_thread_id = 0;
-static pthread_t mic_thread_id = 0;
 static pthread_t wb_thread_id = 0;
 static pthread_t rx_thread_id[MAX_RCVRS] = {0,};
 static void   *highprio_thread(void*);
 static void   *ddc_specific_thread(void*);
-static void   *mic_thread(void *);
 static void   *wb_thread(void *);
 static void   *rx_thread(void *);
 
@@ -90,9 +87,12 @@ extern int clock_nanosleep(clockid_t __clock_id, int __flags,
 void run_cmd(char *cmd)
 {
     pid_t pid;
-    char *argv[] = {"sh", "-c", cmd, NULL};
+    char cmdout[128];
+    char *argv[] = {"sh", "-c", cmdout, NULL};
     int status;
 
+    strcpy(cmdout, cmd);
+    strcat(cmdout, " 2>&1 > /dev/null");
     t_print("Command: %s\n", cmd);
     status = posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ);
     if (status == 0) {
@@ -130,7 +130,7 @@ void setupStream(struct rcvr_cb *rcb)
 void closeStream(struct rcvr_cb *rcb)
 {
     char command[256];
-    sprintf (command, "tune -s %d -f 0 %s 2>&1 > /dev/null", rcb->ssrc, mcb.control_maddr);
+    sprintf (command, "tune -s %d -f 0 %s", rcb->ssrc, mcb.control_maddr);
     run_cmd(command);
     rcb->mInput_fd = -1;
 }
@@ -230,13 +230,13 @@ void *hpsdrsim_sendiq_thr_func (void *arg)
     t_print("Starting hpsdrsim_sendiq_thr_func() rcvr %d...\n", rcb->rcvr_num);
 
     char command[256];
-    sprintf (command, "tune -s %d -m iq -e F32LE %s 2>&1 > /dev/null", rcb->ssrc, mcb.control_maddr);
+    sprintf (command, "tune -s %d -m iq -e F32LE %s", rcb->ssrc, mcb.control_maddr);
     run_cmd(command);
 
     setupStream(rcb);
     while (!do_exit) {
         if (!ddcenable[rcb->rcvr_num]) {
-            usleep(500000);
+            usleep(50000);
             continue;
         }
 
@@ -370,10 +370,6 @@ int main (int argc, char *argv[])
 
     if (pthread_create(&ddc_specific_thread_id, NULL, ddc_specific_thread, NULL) < 0) {
         t_perror("***** ERROR: Create DDC specific thread");
-    }
-
-    if (pthread_create(&mic_thread_id, NULL, mic_thread, NULL) < 0) {
-        t_perror("***** ERROR: Create MIC thread");
     }
 
     if (mcb.wideband) {
@@ -751,9 +747,9 @@ void *ddc_specific_thread(void *data)
     while (!do_exit) {
         if (!running) {
             seqnum = 0;
-            usleep(500000);
+            usleep(50000);
             continue;
-	}
+        }
 
         rc = recvfrom(sock, ddc_buffer, 1444, 0, (struct sockaddr *)&addr, &lenaddr);
         if (rc < 0 && errno != EAGAIN) {
@@ -808,7 +804,7 @@ void *ddc_specific_thread(void *data)
                 }
 
                 char scommand[256];
-                sprintf (scommand, "tune -s %d -R %d -L %d -H %d --rfatten %d -g %d %s 2>&1 > /dev/null",
+                sprintf (scommand, "tune -s %d -R %d -L %d -H %d --rfatten %d -g %d %s",
                          rcb->ssrc, rcb->output_rate+((rxrate[i] > 192)?100:0), (int)(rcb->output_rate * -0.49),
                          (int)(rcb->output_rate * 0.49), mcb.att, mcb.gain, mcb.control_maddr);
                 run_cmd(scommand);
@@ -883,7 +879,7 @@ void *rx_thread(void *data)
     t_print("Starting rx_thread (%d)\n", myddc);
     while (!do_exit) {
         if (!gen_rcvd || ddcenable[myddc] <= 0 || rxrate[myddc] == 0 || rxfreq[myddc] == 0) {
-            usleep(500000);
+            usleep(50000);
             seqnum = 0;
             continue;
         }
@@ -936,8 +932,7 @@ void *rx_thread(void *data)
         if (rcb->new_freq) {
             rcb->curr_freq = rcb->new_freq;
             char fcommand[256];
-            sprintf (fcommand, "tune -s %d -f %d %s 2>&1 > /dev/null",
-                     rcb->ssrc, rcb->new_freq, mcb.control_maddr);
+            sprintf (fcommand, "tune -s %d -f %d %s", rcb->ssrc, rcb->new_freq, mcb.control_maddr);
             run_cmd(fcommand);
             rcb->new_freq = 0;
         }
@@ -1011,79 +1006,5 @@ void *wb_thread(void *data)
     }
 
     t_print("Ending wb_thread\n");
-    return NULL;
-}
-
-//
-// The microphone thread just sends silence, that is
-// a "zeroed" mic frame every 1.333 msec and needs to
-// be sent for some app's timing purposes.
-//
-void *mic_thread(void *data)
-{
-    int sock;
-    unsigned long seqnum = 0;
-    struct sockaddr_in addr;
-    unsigned char mic_buffer[132];
-    unsigned char *p;
-    int yes = 1;
-    struct timespec delay;
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
-
-    if (sock < 0) {
-        t_perror("***** ERROR: Mic thread: socket");
-        return NULL;
-    }
-
-    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
-    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
-    memset(&addr, 0, sizeof(addr));
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_port = htons(mic_port);
-
-    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        t_perror("mic_thread ERROR: bind");
-        close(sock);
-        return NULL;
-    }
-
-    memset(mic_buffer, 0, 132);
-    clock_gettime(CLOCK_MONOTONIC, &delay);
-
-    t_print("Starting mic_thread\n");
-    while (!do_exit) {
-        if (!gen_rcvd || !running) {
-            usleep(500000);
-            seqnum = 0;
-            continue;
-        }
-        // update seq number
-        p = mic_buffer;
-        *(uint32_t*)p = htonl(seqnum++);
-        p += 4;
-
-#if 1
-        // 64 samples with 48000 kHz, makes 1333333 nsec
-        delay.tv_nsec += 1333333;
-
-        while (delay.tv_nsec >= 1000000000) {
-            delay.tv_nsec -= 1000000000;
-            delay.tv_sec++;
-        }
-
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &delay, NULL);
-#else
-        usleep(1333);
-#endif
-
-        if (sendto(sock, mic_buffer, 132, 0, (struct sockaddr * )&addr_new, sizeof(addr_new)) < 0) {
-            t_perror("***** ERROR: Mic thread sendto");
-            break;
-        }
-    }
-
-    t_print("Ending mic_thread\n");
-    close(sock);
     return NULL;
 }
