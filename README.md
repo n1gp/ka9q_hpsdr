@@ -29,9 +29,6 @@ I run ka9q_hpsdr on the same PC as ka9q-radio and in a top level directory along
 side ka9q-radio. If ka9q-radio isn't in an adjacent directory, needed source
 code from ka9q-radio is used from the ALT_SRC directory.
 
-make USE_INSTALLED_TOOLS=1
-
-
 I made a small patch that modifies rx888.c to write 16k of raw ADC samples
 every 66ms to a ramdisk. That data is then used by ka9q_hpsdr to provide a
 wideband spectrum for HPSDR programs which implement it. It would be much
@@ -47,6 +44,7 @@ If you can suggest improvements or find bugs please post something to the Issues
 tab on https://github.com/n1gp/ka9q_hpsdr
 
 Issues:
+
 Rarely I have seen that when initializing the channel, the high and low filters
 get set to 5KHz and -5KHz. I'm guessing that the control packet with the proper
 settings didn't make it to ka9q-radio.
