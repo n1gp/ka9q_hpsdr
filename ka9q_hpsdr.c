@@ -64,6 +64,7 @@ static int adcdither = -1;
 static int adcrandom = -1;
 static int stepatt0 = -1;
 static int ddc_port = 1025;
+static int mic_port = 1026;
 static int hp_port = 1027; // also wb_port
 static int ddc0_port = 1035;
 static unsigned char pbuf[MAX_RCVRS][238*6];
@@ -72,10 +73,12 @@ static int hp_sock;
 
 static pthread_t highprio_thread_id = 0;
 static pthread_t ddc_specific_thread_id = 0;
+static pthread_t mic_thread_id = 0;
 static pthread_t wb_thread_id = 0;
 static pthread_t rx_thread_id[MAX_RCVRS] = {0,};
 static void   *highprio_thread(void*);
 static void   *ddc_specific_thread(void*);
+static void   *mic_thread(void *);
 static void   *wb_thread(void *);
 static void   *rx_thread(void *);
 
@@ -363,6 +366,10 @@ int main (int argc, char *argv[])
 
     if (pthread_create(&ddc_specific_thread_id, NULL, ddc_specific_thread, NULL) < 0) {
         t_perror("***** ERROR: Create DDC specific thread");
+    }
+
+    if (pthread_create(&mic_thread_id, NULL, mic_thread, NULL) < 0) {
+        t_perror("***** ERROR: Create MIC thread");
     }
 
     if (mcb.wideband) {
@@ -993,5 +1000,75 @@ void *wb_thread(void *data)
     }
 
     t_print("Ending wb_thread\n");
+    return NULL;
+}
+
+//
+// The microphone thread just sends silence, that is
+// a "zeroed" mic frame every 1.333 msec and needs to
+// be sent for some app's timing purposes.
+//
+void *mic_thread(void *data)
+{
+    int sock;
+    unsigned long seqnum = 0;
+    struct sockaddr_in addr;
+    unsigned char mic_buffer[132];
+    unsigned char *p;
+    int yes = 1;
+    struct timespec delay;
+    sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    if (sock < 0) {
+        t_perror("***** ERROR: Mic thread: socket");
+        return NULL;
+    }
+
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+    setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(mic_port);
+
+    if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        t_perror("mic_thread ERROR: bind");
+        close(sock);
+        return NULL;
+    }
+
+    memset(mic_buffer, 0, 132);
+    clock_gettime(CLOCK_MONOTONIC, &delay);
+
+    t_print("Starting mic_thread\n");
+    while (!do_exit) {
+        if (!gen_rcvd || !running) {
+            usleep(500000);
+            seqnum = 0;
+            continue;
+        }
+        // update seq number
+        p = mic_buffer;
+        *(uint32_t*)p = htonl(seqnum++);
+        p += 4;
+
+        // 64 samples with 48000 kHz, makes 1333333 nsec
+        delay.tv_nsec += 1333333;
+
+        while (delay.tv_nsec >= 1000000000) {
+            delay.tv_nsec -= 1000000000;
+            delay.tv_sec++;
+        }
+
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &delay, NULL);
+
+        if (sendto(sock, mic_buffer, 132, 0, (struct sockaddr * )&addr_new, sizeof(addr_new)) < 0) {
+            t_perror("***** ERROR: Mic thread sendto");
+            break;
+        }
+    }
+
+    t_print("Ending mic_thread\n");
+    close(sock);
     return NULL;
 }
