@@ -35,6 +35,7 @@
 static int do_exit = 0;
 struct main_cb mcb;
 static int sock_udp;
+static int interface_offset = 0;
 
 static u_int send_flags = 0;
 static u_int done_send_flags = 0;
@@ -271,9 +272,77 @@ void *hpsdrsim_sendiq_thr_func (void *arg)
     pthread_exit (NULL);
 }
 
+int find_net(char *find)
+{
+    DIR* dir;
+    struct dirent* ent;
+    char* endptr;
+
+    if (!(dir = opendir("/sys/class/net"))) {
+        perror("can't open /sys/class/net");
+        return 0;
+    }
+
+    while((ent = readdir(dir)) != NULL) {
+        if (!strcmp("print", find) && strcmp(".", ent->d_name) && strcmp("..", ent->d_name)) {
+            printf("%s ", ent->d_name);
+        } else if (!strcmp(ent->d_name, find)) {
+            return 1;
+        }
+        if (*endptr != '\0') {
+            continue;
+        }
+    }
+    return 0;
+}
+
+int proc_find(char name[][16], char *find)
+{
+    DIR* dir;
+    struct dirent* ent;
+    char* endptr;
+    int i, name_found = 0;
+    char buf[512];
+
+    if (!(dir = opendir("/proc"))) {
+        perror("can't open /proc");
+        return 0;
+    }
+
+    while((ent = readdir(dir)) != NULL) {
+        long lpid = strtol(ent->d_name, &endptr, 10);
+        if (*endptr != '\0') {
+            continue;
+        }
+
+        snprintf(buf, sizeof(buf), "/proc/%ld/cmdline", lpid);
+        FILE* fp = fopen(buf, "r");
+
+        if (fp) {
+            if (fgets(buf, sizeof(buf), fp) != NULL) {
+                // check the first token in the file, the program name
+                char* first = strtok(buf, "\0");
+                if (strstr(first, find) != NULL) {
+                    for (i = 0; i < sizeof(buf); i++) {
+                        if (!strcmp(&buf[i], "-i")) {
+                            strcpy(name[name_found], &buf[i+3]);
+                            if (++name_found >= MAX_PRGMS)
+                                goto finishup;
+                            break;
+                        }
+                    }
+                }
+            }
+            fclose(fp);
+        }
+    }
+
+finishup:
+    closedir(dir);
+    return name_found;
+}
 int main (int argc, char *argv[])
 {
-    int count = 0;
     uint8_t id[4] = { 0xef, 0xfe, 1, 6 };
     struct sockaddr_in addr_udp;
     struct sockaddr_in addr_from;
@@ -284,12 +353,6 @@ int main (int argc, char *argv[])
     uint32_t i, code;
     u_char buffer[MAX_BUFFER_LEN];
     uint32_t *code0;
-    const int MAC1 = 0x00;
-    const int MAC2 = 0x1C;
-    const int MAC3 = 0xC0;
-    const int MAC4 = 0xA2;
-    const int MAC5 = 0x10;
-    const int MAC6 = 0xDD;
     int CmdOption;
     struct sigaction sigact;
 
@@ -303,7 +366,7 @@ int main (int argc, char *argv[])
     strcpy(mcb.data_maddr, "hf-iq.local");
     strcpy(mcb.control_maddr, "hf.local");
 
-    while((CmdOption = getopt(argc, argv, "a:c:d:g:n:hw:")) != -1) {
+    while((CmdOption = getopt(argc, argv, "a:c:d:g:i:n:hw:")) != -1) {
         switch(CmdOption) {
         case 'h':
             printf("Usage: %s <optional arguments>\n", basename(argv[0]));
@@ -313,6 +376,7 @@ int main (int argc, char *argv[])
             printf("-c control maddr (default hf.local))\n");
             printf("-g tuner gain in 1/10's dB (default 60))\n");
             printf("-h help (prints this usage)\n");
+            printf("-i net interface (required)\n");
             printf("-n number of receiver slices (defaults to 8 max)\n");
             printf("-w enable wideband 0/1 (default is 0, disabled)\n");
             return EXIT_SUCCESS;
@@ -330,6 +394,9 @@ int main (int argc, char *argv[])
         case 'g':
             mcb.gain = atoi (optarg);
             break;
+        case 'i':
+            strcpy (mcb.interface, optarg);
+            break;
         case 'n':
             mcb.num_rxs = atoi (optarg);
             break;
@@ -340,12 +407,72 @@ int main (int argc, char *argv[])
     }
     printf("\n");
 
+    // user error checking...
+    if (strlen(mcb.interface) == 0) {
+        printf("Must use -i for net interface selection.\n");
+        printf("These are the available interfaces:\n\t");
+        find_net("print");
+        printf("\n");
+        return EXIT_FAILURE;
+    }
+
+    if (find_net(mcb.interface) == 0 || mcb.interface[0] != 'e') {
+        printf("%s not found or not useable\n", mcb.interface);
+        return EXIT_FAILURE;
+    }
+
+    int same_int = 0;
+    char myproc[MAX_PRGMS][16] = {0,};
+    // see how many different net interfaces these prgm's are using
+    for (i = 0; i < proc_find(myproc, "ka9q_hpsdr"); i++) {
+        if (!strcmp(myproc[i], mcb.interface))
+            same_int++;
+    }
+
+    if (same_int > 1) {
+        printf("interface %s already in use\n", mcb.interface);
+        return EXIT_FAILURE;
+    }
+
+    // expect virtual interface to have a following .x, i.e. phys_net:eno1 virt_net:eno1.1
+    // then use that to offset ssrc ID's to ka9q-radio
+    sscanf(mcb.interface, "%*[^.].%d", &interface_offset);
+    if (interface_offset > 0) {
+        mcb.wideband = 0;
+    }
     if ((sock_udp = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         t_perror("socket");
         return EXIT_FAILURE;
     }
+    struct ifreq hwaddr;
+    memset(&hwaddr, 0, sizeof(hwaddr));
+    strncpy(hwaddr.ifr_name, mcb.interface, IFNAMSIZ - 1);
+    ioctl(sock_udp, SIOCGIFHWADDR, &hwaddr);
+
+    struct ifaddrs *ifap, *ifa;
+    struct sockaddr_in *sa;
+    char *addr;
+
+    // get the IP address of the desired interface
+    getifaddrs (&ifap);
+    for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr && ifa->ifa_addr->sa_family==AF_INET) {
+            sa = (struct sockaddr_in *) ifa->ifa_addr;
+            addr = inet_ntoa(sa->sin_addr);
+            if (!strcmp(mcb.interface, ifa->ifa_name)) {
+                strcpy(mcb.ip, addr);
+            }
+        }
+    }
+    freeifaddrs(ifap);
 
     setsockopt(sock_udp, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+#if 1
+    if (setsockopt(sock_udp, SOL_SOCKET, SO_BINDTODEVICE,
+                            mcb.interface, sizeof(mcb.interface)) < 0) {
+        perror ("SO_BINDTODEVICE");
+    }
+#endif
     setsockopt(sock_udp, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     tv.tv_sec = 0;
     tv.tv_usec = 1000;
@@ -353,6 +480,7 @@ int main (int argc, char *argv[])
     memset(&addr_udp, 0, sizeof(addr_udp));
     addr_udp.sin_family = AF_INET;
     addr_udp.sin_addr.s_addr = htonl(INADDR_ANY);
+    //addr_udp.sin_addr.s_addr = inet_addr(mcb.ip);
     addr_udp.sin_port = htons(1024);
 
     if (bind(sock_udp, (struct sockaddr *)&addr_udp, sizeof(addr_udp)) < 0) {
@@ -396,7 +524,7 @@ int main (int argc, char *argv[])
         mcb.rcb[i].new_freq = 0;
         mcb.rcb[i].curr_freq = 10000000;
         mcb.rcb[i].output_rate = 192000;
-        mcb.rcb[i].ssrc = i + 1;
+        mcb.rcb[i].ssrc = i + 1 + (interface_offset * MAX_RCVRS);
         mcb.rcb[i].scale = 700.0f;
 
         mcb.rcb[i].rcvr_num = i;
@@ -412,7 +540,6 @@ int main (int argc, char *argv[])
 
     while (!do_exit) {
         memcpy(buffer, id, 4);
-        count++;
         lenaddr = sizeof(addr_from);
         bytes_read = recvfrom(sock_udp, buffer, HPSDR_FRAME_LEN, 0, (struct sockaddr *)&addr_from, &lenaddr);
 
@@ -425,7 +552,6 @@ int main (int argc, char *argv[])
             continue;
         }
 
-        count = 0;
         code = *code0;
 
         /*
@@ -434,17 +560,12 @@ int main (int argc, char *argv[])
          * NewProtocol "General"   packet   60 bytes starting with 00 00 00 00 00
          *                                  ==> this starts NewProtocol radio
          */
-        if (code == 0 && buffer[4] == 0x02) {
+        if (code == 0 && buffer[4] == 0x02 && !running) {
             t_print("NewProtocol discovery packet received from %s\n", inet_ntoa(addr_from.sin_addr));
             // prepare response
             memset(buffer, 0, 60);
             buffer [4] = 0x02 + running;
-            buffer [5] = MAC1;
-            buffer[ 6] = MAC2;
-            buffer[ 7] = MAC3;
-            buffer[ 8] = MAC4;
-            buffer[ 9] = MAC5;
-            buffer[10] = MAC6;
+            for (i = 0; i < 6; ++i) buffer[i + 5] = hwaddr.ifr_addr.sa_data[i];
             buffer[11] = HERMES;
             buffer[12] = 38;
             buffer[13] = 18;
@@ -605,13 +726,20 @@ void *highprio_thread(void *data)
     }
 
     setsockopt(hp_sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+#if 0
+    if (setsockopt(hp_sock, SOL_SOCKET, SO_BINDTODEVICE,
+                            mcb.interface, sizeof(mcb.interface)) < 0) {
+        perror ("SO_BINDTODEVICE");
+    }
+#endif
     setsockopt(hp_sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     tv.tv_sec = 0;
     tv.tv_usec = 10000;
     setsockopt(hp_sock, SOL_SOCKET, SO_RCVTIMEO, (void *)&tv, sizeof(tv));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    //addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = inet_addr(mcb.ip);
     addr.sin_port = htons(hp_port);
 
     if (bind(hp_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -726,13 +854,20 @@ void *ddc_specific_thread(void *data)
     }
 
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+#if 0
+    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+                            mcb.interface, sizeof(mcb.interface)) < 0) {
+        perror ("SO_BINDTODEVICE");
+    }
+#endif
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     tv.tv_sec = 0;
     tv.tv_usec = 10000;
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *)&tv, sizeof(tv));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = inet_addr(mcb.ip);
+    //addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(ddc_port);
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -860,10 +995,17 @@ void *rx_thread(void *data)
     }
 
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+#if 0
+    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+                            mcb.interface, sizeof(mcb.interface)) < 0) {
+        perror ("SO_BINDTODEVICE");
+    }
+#endif
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = inet_addr(mcb.ip);
+    //addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(ddc0_port + myddc);
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -1025,10 +1167,17 @@ void *mic_thread(void *data)
     }
 
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
+#if 0
+    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
+                            mcb.interface, sizeof(mcb.interface)) < 0) {
+        perror ("SO_BINDTODEVICE");
+    }
+#endif
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = inet_addr(mcb.ip);
+    //addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(mic_port);
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
