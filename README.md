@@ -3,8 +3,38 @@ data and sent via ethernet UDP packets. Protocol2 is defined in this
 document: https://github.com/TAPR/OpenHPSDR-Firmware/blob/master/Protocol%202/Documentation/openHPSDR%20Ethernet%20Protocol%20v4.3.pdf
 
 ka9q_hpsdr currently supports up to 8 receiver channels from ka9q-radio
-defined by MAX_RCVRS. Could handle more depending on the host CPU.
+defined by MAX_RCVRS. This is per instantiation of ka9q_hpsdr. You can
+run another copy of ka9q_hpsdr for up to 16 receiver channels.
+
+The 2nd instance should run on a virtual net interface. These are the 
+steps I used to create a virtual interface:
+
+**Create a virtual interface eno1.1 with a unique MAC on physical eno1**
+
+sudo ip link add link eno1 address 00:1C:C0:A2:10:DE eno1.1 type macvlan
+
+**Bring it up and assign an IP**
+
+sudo ip link set dev eno1.1 up
+
+**For dhcp assign IP**
+
+sudo dhcpcd eno1.1
+
+**or**
+
+sudo dhclient -v eno1.1
+
+**Or static IP**
+
+sudo ip addr add 192.168.1.100/24 dev eno1.1
+
 I put this together to be able to use my RX-888Mk2 for CW skimming.
+
+You can find instructions on how to set up for running two instances 
+of SkimSrv by googling:
+
+running 2 instances of skimsrv
 
 Hopefully this program will help RX888 owners run hpsdr friendly programs
 that can handle multiple receiver slices for skimming cw, ft8, and other modes.
@@ -57,6 +87,6 @@ Screenshots:
 
 <img width="283" height="275" alt="thetis" src="https://github.com/user-attachments/assets/0d5da337-150c-4b89-ad53-f9e6a51db5cd" />
 <img width="413" height="235" alt="sparksdr" src="https://github.com/user-attachments/assets/881db0bb-49f9-48f6-b034-8fb5e906c91e" />
-<img width="250" height="262" alt="skimsvr" src="https://github.com/user-attachments/assets/7f0c231c-f14d-46f9-a836-9f8f1e751ccf" />
+<img width="290" height="245" alt="SkimSrvx2" src="https://github.com/user-attachments/assets/4aaa8617-36c8-4b22-959f-8c83c787387c" />
 
 
