@@ -48,6 +48,8 @@
 #include <complex.h>
 #include <sys/wait.h>
 #include <spawn.h>
+#include <dirent.h>
+#include <ifaddrs.h>
 
 #include "status.h"
 #include "radio.h"
@@ -58,6 +60,7 @@
 #define IQ_FRAME_DATA_LEN 63
 #define IQ_BUF_COUNT 1024
 #define MAX_RCVRS 8
+#define MAX_PRGMS 2
 #define IQ_FRAME_DATA_LEN 63
 #define MAXSTR 128
 #define HERMES 1
@@ -73,6 +76,8 @@ struct main_cb {
     int gain;
     int wideband;
     int num_rxs;
+    char interface[15];
+    char ip[16];
     char data_maddr[128];
     char control_maddr[128];
 
