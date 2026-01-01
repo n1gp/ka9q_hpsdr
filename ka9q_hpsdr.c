@@ -118,7 +118,7 @@ void send_tune(struct rcvr_cb *rcb)
     }
 }
 
-const char *App_path; //RRK
+const char *App_path;
 
 void setupStream(struct rcvr_cb *rcb)
 {
@@ -326,7 +326,7 @@ int proc_find(char name[][16], char *find)
                     for (i = 0; i < sizeof(buf); i++) {
                         if (!strcmp(&buf[i], "-i")) {
                             strcpy(name[name_found], &buf[i+3]);
-                            if (++name_found >= MAX_PRGMS)
+                            if (++name_found > MAX_PRGMS)
                                 goto finishup;
                             break;
                         }
@@ -407,7 +407,14 @@ int main (int argc, char *argv[])
     }
     printf("\n");
 
-    // user error checking...
+    int same_int = 0, prgms_found = 0;
+    char myproc[MAX_PRGMS][16] = {0,};
+    prgms_found = proc_find(myproc, "ka9q_hpsdr");
+    if (prgms_found > MAX_PRGMS) {
+        printf("These are already max: %d ka9q_hpsdr programs running.\n", MAX_PRGMS);
+        return EXIT_FAILURE;
+    }
+
     if (strlen(mcb.interface) == 0) {
         printf("Must use -i for net interface selection.\n");
         printf("These are the available interfaces:\n\t");
@@ -416,15 +423,35 @@ int main (int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+#if 0
+    if (strlen(mcb.interface) == 0) {
+        FILE *pfd = popen("ip route get 1.1.1.1|awk '{print $5}'|tr -dc '[:alnum:]'", "r");
+        if(pfd == NULL) {
+            t_perror("Could not open pipe.\n");
+            return EXIT_FAILURE;
+        }
+        if (fgets(mcb.interface, 15, pfd) == NULL)
+            return EXIT_FAILURE;
+        if (prgms_found > 1) {
+            printf("Must use -i for virtual net interface selection.\n");
+            printf("These are the available interfaces:\n\t");
+            find_net("print");
+            printf("\n");
+            return EXIT_FAILURE;
+	} else {
+	    strcpy(myproc[0], mcb.interface);
+	}
+    }
+#endif
+
     if (find_net(mcb.interface) == 0 || mcb.interface[0] != 'e') {
         printf("%s not found or not useable\n", mcb.interface);
         return EXIT_FAILURE;
     }
 
-    int same_int = 0;
-    char myproc[MAX_PRGMS][16] = {0,};
-    // see how many different net interfaces these prgm's are using
-    for (i = 0; i < proc_find(myproc, "ka9q_hpsdr"); i++) {
+    // see how many different net interfaces these prgm's are
+    // using and check before using the same one
+    for (i = 0; i < prgms_found; i++) {
         if (!strcmp(myproc[i], mcb.interface))
             same_int++;
     }
@@ -436,14 +463,23 @@ int main (int argc, char *argv[])
 
     // expect virtual interface to have a following .x, i.e. phys_net:eno1 virt_net:eno1.1
     // then use that to offset ssrc ID's to ka9q-radio
-    sscanf(mcb.interface, "%*[^.].%d", &interface_offset);
-    if (interface_offset > 0) {
-        mcb.wideband = 0;
+    if (strlen(mcb.interface) > 0) {
+        sscanf(mcb.interface, "%*[^.].%d", &interface_offset);
     }
+
     if ((sock_udp = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         t_perror("socket");
         return EXIT_FAILURE;
     }
+
+    if (interface_offset > 0) {
+        mcb.wideband = 0;
+        if (setsockopt(sock_udp, SOL_SOCKET, SO_BINDTODEVICE,
+                            mcb.interface, sizeof(mcb.interface)) < 0) {
+            perror ("SO_BINDTODEVICE");
+        }
+    }
+
     struct ifreq hwaddr;
     memset(&hwaddr, 0, sizeof(hwaddr));
     strncpy(hwaddr.ifr_name, mcb.interface, IFNAMSIZ - 1);
@@ -467,12 +503,6 @@ int main (int argc, char *argv[])
     freeifaddrs(ifap);
 
     setsockopt(sock_udp, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
-#if 1
-    if (setsockopt(sock_udp, SOL_SOCKET, SO_BINDTODEVICE,
-                            mcb.interface, sizeof(mcb.interface)) < 0) {
-        perror ("SO_BINDTODEVICE");
-    }
-#endif
     setsockopt(sock_udp, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     tv.tv_sec = 0;
     tv.tv_usec = 1000;
@@ -480,7 +510,6 @@ int main (int argc, char *argv[])
     memset(&addr_udp, 0, sizeof(addr_udp));
     addr_udp.sin_family = AF_INET;
     addr_udp.sin_addr.s_addr = htonl(INADDR_ANY);
-    //addr_udp.sin_addr.s_addr = inet_addr(mcb.ip);
     addr_udp.sin_port = htons(1024);
 
     if (bind(sock_udp, (struct sockaddr *)&addr_udp, sizeof(addr_udp)) < 0) {
@@ -675,7 +704,7 @@ void new_protocol_general_packet(unsigned char *buffer)
         t_print("GP: SEQ ERROR, old=%lu new=%lu\n", seqold, seqnum);
     }
 
-    if (mcb.wideband) { //RRK need to update these in wb_thread
+    if (mcb.wideband) {
         rc = buffer[23] & 1;
         if (rc != wbenable) {
             wbenable = rc;
@@ -738,8 +767,7 @@ void *highprio_thread(void *data)
     setsockopt(hp_sock, SOL_SOCKET, SO_RCVTIMEO, (void *)&tv, sizeof(tv));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    //addr.sin_addr.s_addr = htonl(INADDR_ANY);
-    addr.sin_addr.s_addr = inet_addr(mcb.ip);
+    addr.sin_addr.s_addr = (interface_offset > 0) ? inet_addr(mcb.ip) : htonl(INADDR_ANY);
     addr.sin_port = htons(hp_port);
 
     if (bind(hp_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -866,8 +894,7 @@ void *ddc_specific_thread(void *data)
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (void *)&tv, sizeof(tv));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(mcb.ip);
-    //addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = (interface_offset > 0) ? inet_addr(mcb.ip) : htonl(INADDR_ANY);
     addr.sin_port = htons(ddc_port);
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -1004,8 +1031,7 @@ void *rx_thread(void *data)
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(mcb.ip);
-    //addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = (interface_offset > 0) ? inet_addr(mcb.ip) : htonl(INADDR_ANY);
     addr.sin_port = htons(ddc0_port + myddc);
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -1176,8 +1202,7 @@ void *mic_thread(void *data)
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = inet_addr(mcb.ip);
-    //addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = (interface_offset > 0) ? inet_addr(mcb.ip) : htonl(INADDR_ANY);
     addr.sin_port = htons(mic_port);
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
