@@ -6,7 +6,8 @@ ka9q_hpsdr currently supports up to 8 receiver channels from ka9q-radio
 defined by MAX_RCVRS. This is per instantiation of ka9q_hpsdr. You can
 run another copy of ka9q_hpsdr for up to 16 receiver channels.
 
-The 2nd instance should run on a virtual net interface. These are the 
+The 2nd instance can run on a physical or a virtual net interface, as long
+as it's not being used by the 1st instance. These are the 
 steps I used to create a virtual interface:
 
 **Create a virtual interface eno1.1 with a unique MAC on physical eno1**
