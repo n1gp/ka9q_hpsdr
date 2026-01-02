@@ -444,8 +444,8 @@ int main (int argc, char *argv[])
     }
 #endif
 
-    if (find_net(mcb.interface) == 0 || mcb.interface[0] != 'e') {
-        printf("%s not found or not useable\n", mcb.interface);
+    if (find_net(mcb.interface) == 0) {
+        printf("%s not found\n", mcb.interface);
         return EXIT_FAILURE;
     }
 
@@ -461,18 +461,13 @@ int main (int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    // expect virtual interface to have a following .x, i.e. phys_net:eno1 virt_net:eno1.1
-    // then use that to offset ssrc ID's to ka9q-radio
-    if (strlen(mcb.interface) > 0) {
-        sscanf(mcb.interface, "%*[^.].%d", &interface_offset);
-    }
-
     if ((sock_udp = socket(AF_INET, SOCK_DGRAM, 0)) < 0) {
         t_perror("socket");
         return EXIT_FAILURE;
     }
 
-    if (interface_offset > 0) {
+    if (prgms_found > 1) {
+        interface_offset++;
         mcb.wideband = 0;
         if (setsockopt(sock_udp, SOL_SOCKET, SO_BINDTODEVICE,
                             mcb.interface, sizeof(mcb.interface)) < 0) {
