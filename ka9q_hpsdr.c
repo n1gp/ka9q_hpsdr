@@ -45,8 +45,6 @@ static pthread_cond_t send_cond = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t done_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t done_send_cond = PTHREAD_COND_INITIALIZER;
 
-static pthread_t hpsdrsim_sendiq_thr_id[MAX_RCVRS];
-
 static int running = 0;
 static bool gen_rcvd = false;
 static bool wbenable = false;
@@ -71,6 +69,7 @@ static int hp_port = 1027; // also wb_port
 static int ddc0_port = 1035;
 static unsigned char pbuf[MAX_RCVRS][238*6];
 
+static pthread_t sendiq_thread_id[MAX_RCVRS];
 static pthread_t highprio_thread_id = 0;
 static pthread_t ddc_specific_thread_id = 0;
 static pthread_t mic_thread_id = 0;
@@ -117,6 +116,8 @@ void send_tune(struct rcvr_cb *rcb)
                  rcb->ssrc, rcb->curr_freq, rcb->output_rate+((rxrate[rcb->rcvr_num] > 192)?100:0),
                  (int)(rcb->output_rate * -0.49), (int)(rcb->output_rate * 0.49),
                  mcb.att, mcb.gain, mcb.control_maddr);
+
+        t_print("Command: %s\n", cmd);
 
         fp = popen(cmd, "r");
         if (fp == NULL) {
@@ -248,10 +249,14 @@ uint64_t get_posix_clock_time_us()
 
 void sdr_sighandler (int signum)
 {
-    t_print ("Signal caught, exiting!\n");
+    t_print ("Signal:%d caught, exiting!\n", signum);
     do_exit = 1;
     running = 0;
     usleep(700000);
+    for (int i = 0; i < mcb.num_rxs; i++) {
+        mcb.rcb->curr_freq = 0;
+        send_tune(mcb.rcb);
+    }
 }
 
 char *time_stamp ()
@@ -265,7 +270,7 @@ char *time_stamp ()
     return timestamp;
 }
 
-void *hpsdrsim_sendiq_thr_func (void *arg)
+void *sendiq_thread (void *arg)
 {
     int samps_packet = 238;
     ssize_t num_samps = 0;
@@ -275,7 +280,7 @@ void *hpsdrsim_sendiq_thr_func (void *arg)
 
     rcb->iqSample_offset = rcb->iqSamples_remaining = 0;
     rcb->err_count = 0;
-    t_print("Starting hpsdrsim_sendiq_thr_func() rcvr %d...\n", rcb->rcvr_num);
+    t_print("Starting sendiq_thread(%d)\n", rcb->rcvr_num);
 
     send_tune(rcb);
     setupStream(rcb);
@@ -316,7 +321,7 @@ void *hpsdrsim_sendiq_thr_func (void *arg)
         }
     }
 
-    t_print("Ending hpsdrsim_sendiq_thr_func() rcvr %d.\n", rcb->rcvr_num);
+    t_print("Ending sendiq_thread(%d)\n", rcb->rcvr_num);
     pthread_exit (NULL);
 }
 
@@ -603,8 +608,8 @@ int main (int argc, char *argv[])
         mcb.rcvrs_mask |= 1 << i;
         mcb.rcb[i].rcvr_mask = 1 << i;
         // this sets up the mcast stream so fire it off before starting the rx's
-        if (pthread_create(&hpsdrsim_sendiq_thr_id[i], NULL, hpsdrsim_sendiq_thr_func, &mcb.rcb[i]) < 0) {
-            t_perror("***** ERROR: Create hpsdrsim_sendiq_thr");
+        if (pthread_create(&sendiq_thread_id[i], NULL, sendiq_thread, &mcb.rcb[i]) < 0) {
+            t_perror("***** ERROR: Create sendiq_thread");
         }
     }
 
@@ -798,12 +803,6 @@ void *highprio_thread(void *data)
     }
 
     setsockopt(hp_sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
-#if 0
-    if (setsockopt(hp_sock, SOL_SOCKET, SO_BINDTODEVICE,
-                   mcb.interface, sizeof(mcb.interface)) < 0) {
-        perror ("SO_BINDTODEVICE");
-    }
-#endif
     setsockopt(hp_sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     tv.tv_sec = 0;
     tv.tv_usec = 10000;
@@ -925,12 +924,6 @@ void *ddc_specific_thread(void *data)
     }
 
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
-#if 0
-    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
-                   mcb.interface, sizeof(mcb.interface)) < 0) {
-        perror ("SO_BINDTODEVICE");
-    }
-#endif
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     tv.tv_sec = 0;
     tv.tv_usec = 10000;
@@ -1065,12 +1058,6 @@ void *rx_thread(void *data)
     }
 
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
-#if 0
-    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
-                   mcb.interface, sizeof(mcb.interface)) < 0) {
-        perror ("SO_BINDTODEVICE");
-    }
-#endif
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -1083,7 +1070,7 @@ void *rx_thread(void *data)
         return NULL;
     }
 
-    t_print("Starting rx_thread (%d)\n", myddc);
+    t_print("Starting rx_thread(%d)\n", myddc);
     while (!do_exit) {
         if (!gen_rcvd || ddcenable[myddc] <= 0 || rxrate[myddc] == 0 || rxfreq[myddc] == 0) {
             usleep(50000);
@@ -1144,7 +1131,7 @@ void *rx_thread(void *data)
     }
 
     close(sock);
-    t_print("Ending rx_thread (%d)\n", myddc);
+    t_print("Ending rx_thread(%d)\n", myddc);
     rx_thread_id[myddc] = 0;
     ddcenable[myddc] = 0;
     return NULL;
@@ -1165,7 +1152,7 @@ void *wb_thread(void *data)
     char *filename = "/dev/shm/rx888wb.bin";
     size_t bytes_read;
 
-    t_print("Starting wb_thread\n");
+    t_print("Starting wb_thread()\n");
     while (!do_exit) {
         if (!gen_rcvd || !running || !wbenable) {
             usleep(50000);
@@ -1210,7 +1197,7 @@ void *wb_thread(void *data)
         }
     }
 
-    t_print("Ending wb_thread\n");
+    t_print("Ending wb_thread()\n");
     return NULL;
 }
 
@@ -1236,12 +1223,6 @@ void *mic_thread(void *data)
     }
 
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
-#if 0
-    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
-                   mcb.interface, sizeof(mcb.interface)) < 0) {
-        perror ("SO_BINDTODEVICE");
-    }
-#endif
     setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, (void *)&yes, sizeof(yes));
     memset(&addr, 0, sizeof(addr));
     addr.sin_family = AF_INET;
@@ -1257,7 +1238,7 @@ void *mic_thread(void *data)
     memset(mic_buffer, 0, 132);
     clock_gettime(CLOCK_MONOTONIC, &delay);
 
-    t_print("Starting mic_thread\n");
+    t_print("Starting mic_thread()\n");
     while (!do_exit) {
         if (!gen_rcvd || !running) {
             usleep(500000);
@@ -1285,7 +1266,7 @@ void *mic_thread(void *data)
         }
     }
 
-    t_print("Ending mic_thread\n");
+    t_print("Ending mic_thread()\n");
     close(sock);
     return NULL;
 }
