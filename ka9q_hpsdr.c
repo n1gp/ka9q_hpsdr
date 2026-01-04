@@ -254,8 +254,8 @@ void sdr_sighandler (int signum)
     running = 0;
     usleep(700000);
     for (int i = 0; i < mcb.num_rxs; i++) {
-        mcb.rcb->curr_freq = 0;
-        send_tune(mcb.rcb);
+        mcb.rcb[i].curr_freq = 0;
+        send_tune(&mcb.rcb[i]);
     }
 }
 
