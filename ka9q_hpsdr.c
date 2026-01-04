@@ -35,6 +35,7 @@
 static int do_exit = 0;
 struct main_cb mcb;
 static int sock_udp;
+static int hp_sock;
 static int interface_offset = 0;
 
 static u_int send_flags = 0;
@@ -70,8 +71,6 @@ static int hp_port = 1027; // also wb_port
 static int ddc0_port = 1035;
 static unsigned char pbuf[MAX_RCVRS][238*6];
 
-static int hp_sock;
-
 static pthread_t highprio_thread_id = 0;
 static pthread_t ddc_specific_thread_id = 0;
 static pthread_t mic_thread_id = 0;
@@ -90,32 +89,81 @@ extern int clock_nanosleep(clockid_t __clock_id, int __flags,
 
 void send_tune(struct rcvr_cb *rcb)
 {
-    pid_t pid;
+    FILE *fp;
     char cmd[384];
-    char *argv[] = {"sh", "-c", cmd, NULL};
-    int status;
+    char buffer[384];
+    char *bptr;
+    bool retry = false;
+    int i, number, retrycnt = 0;
 
-    sprintf (cmd, "tune -s %d -f %d -m iq -e F32LE -R %d -L %d -H %d --rfatten %d -g %d %s",
-            rcb->ssrc, rcb->curr_freq, rcb->output_rate+((rxrate[rcb->rcvr_num] > 192)?100:0),
-            (int)(rcb->output_rate * -0.49), (int)(rcb->output_rate * 0.49),
-            mcb.att, mcb.gain, mcb.control_maddr);
-
-    t_print("Command: %s\n", cmd);
-    strcat(cmd, " 2>&1 > /dev/null");
-    status = posix_spawn(&pid, "/bin/sh", NULL, NULL, argv, environ);
-    if (status == 0) {
-        //t_print("Child pid: %i\n", pid);
-        do {
-            if (waitpid(pid, &status, 0) != -1) {
-                //t_print("Child status %d\n", WEXITSTATUS(status));
-            } else {
-                t_perror("waitpid");
-                exit(1);
+    void extract_num(char *numstr) {
+        char tempstr[64];
+        number = 0;
+        for (i = 0; i < strlen(numstr); i++) {
+            if (numstr[i] == '.') {
+                tempstr[number++] = '\0';
+                break;
             }
-        } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-    } else {
-        t_print("posix_spawn: %s\n", strerror(status));
+            if (numstr[i] >= '0' && numstr[i] <= '9')
+                tempstr[number++] = numstr[i];
+        }
+        tempstr[number] = '\0';
+        number = atoi(tempstr);
     }
+
+    // retry sending this cmd if ka9q-radio reports a mismatch
+    do {
+        sprintf (cmd, "tune -s %d -f %d -m iq -e F32LE -R %d -L %d -H %d --rfatten %d -g %d %s",
+                 rcb->ssrc, rcb->curr_freq, rcb->output_rate+((rxrate[rcb->rcvr_num] > 192)?100:0),
+                 (int)(rcb->output_rate * -0.49), (int)(rcb->output_rate * 0.49),
+                 mcb.att, mcb.gain, mcb.control_maddr);
+
+        fp = popen(cmd, "r");
+        if (fp == NULL) {
+            t_perror("popen failed");
+            return;
+        }
+
+        while (fgets(buffer, sizeof(buffer), fp) != NULL) {
+            if((bptr = strstr(buffer, "Preset")) != NULL) {
+                if (strncmp(bptr+7, "iq", 2)) retry = true;
+            }
+            if((bptr = strstr(buffer, "Sample rate")) != NULL) {
+                sscanf(bptr+12, "%s", cmd);
+                extract_num(cmd);
+                if (number != rcb->output_rate) retry = true;
+            }
+            if((bptr = strstr(buffer, "Encoding")) != NULL) {
+                if (strncmp(bptr+9, "f32le", 5)) retry = true;
+            }
+            if((bptr = strstr(buffer, "Frequency")) != NULL) {
+                sscanf(bptr+10, "%s", cmd);
+                extract_num(cmd);
+                if (number != rcb->curr_freq) retry = true;
+            }
+            if((bptr = strstr(buffer, "Channel Gain")) != NULL) {
+                sscanf(bptr+13, "%s", cmd);
+                extract_num(cmd);
+                if (number != mcb.gain) retry = true;
+            }
+            if((bptr = strstr(buffer, "RF Atten")) != NULL) {
+                sscanf(bptr+9, "%s", cmd);
+                extract_num(cmd);
+                if (number != mcb.att) retry = true;
+            }
+        }
+
+        if (retry) {
+            retry = false;
+            retrycnt++;
+            t_print("Retrying send_tune() for rx%d\n", rcb->rcvr_num);
+        } else retrycnt--;
+
+        int status = pclose(fp);
+        if (status == -1) {
+            t_perror("pclose failed");
+        }
+    } while (retrycnt > 0 && retrycnt < 3);
 }
 
 const char *App_path;
@@ -438,9 +486,9 @@ int main (int argc, char *argv[])
             find_net("print");
             printf("\n");
             return EXIT_FAILURE;
-	} else {
-	    strcpy(myproc[0], mcb.interface);
-	}
+        } else {
+            strcpy(myproc[0], mcb.interface);
+        }
     }
 #endif
 
@@ -470,7 +518,7 @@ int main (int argc, char *argv[])
         interface_offset++;
         mcb.wideband = 0;
         if (setsockopt(sock_udp, SOL_SOCKET, SO_BINDTODEVICE,
-                            mcb.interface, sizeof(mcb.interface)) < 0) {
+                       mcb.interface, sizeof(mcb.interface)) < 0) {
             perror ("SO_BINDTODEVICE");
         }
     }
@@ -752,7 +800,7 @@ void *highprio_thread(void *data)
     setsockopt(hp_sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
 #if 0
     if (setsockopt(hp_sock, SOL_SOCKET, SO_BINDTODEVICE,
-                            mcb.interface, sizeof(mcb.interface)) < 0) {
+                   mcb.interface, sizeof(mcb.interface)) < 0) {
         perror ("SO_BINDTODEVICE");
     }
 #endif
@@ -879,7 +927,7 @@ void *ddc_specific_thread(void *data)
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
 #if 0
     if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
-                            mcb.interface, sizeof(mcb.interface)) < 0) {
+                   mcb.interface, sizeof(mcb.interface)) < 0) {
         perror ("SO_BINDTODEVICE");
     }
 #endif
@@ -1019,7 +1067,7 @@ void *rx_thread(void *data)
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
 #if 0
     if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
-                            mcb.interface, sizeof(mcb.interface)) < 0) {
+                   mcb.interface, sizeof(mcb.interface)) < 0) {
         perror ("SO_BINDTODEVICE");
     }
 #endif
@@ -1190,7 +1238,7 @@ void *mic_thread(void *data)
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (void *)&yes, sizeof(yes));
 #if 0
     if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE,
-                            mcb.interface, sizeof(mcb.interface)) < 0) {
+                   mcb.interface, sizeof(mcb.interface)) < 0) {
         perror ("SO_BINDTODEVICE");
     }
 #endif
