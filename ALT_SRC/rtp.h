@@ -1,16 +1,28 @@
 #ifndef _RTP_H
 #define _RTP_H 1
 
-#define DEFAULT_MCAST_PORT (5004)
-#define DEFAULT_RTP_PORT (5004)
-#define DEFAULT_RTCP_PORT (5005)
-#define DEFAULT_STAT_PORT (5006)
+#include <stdint.h>
+#include <stddef.h>
+#include <stdbool.h>
+
+#define DEFAULT_MCAST_PORT ((uint16_t)5004)
+#define DEFAULT_RTP_PORT ((uint16_t)5004)
+#define DEFAULT_RTCP_PORT ((uint16_t)5005)
+#define DEFAULT_STAT_PORT ((uint16_t)5006)
 
 #define NTP_EPOCH 2208988800UL // Seconds between Jan 1 1900 and Jan 1 1970
 
 #define RTP_MIN_SIZE 12  // min size of RTP header
 #define RTP_VERS 2U
 #define RTP_MARKER 0x80  // Marker flag in mpt field
+
+#define OPUS_SAMPRATE (48000)
+#define PKTSIZE 65536 // Largest possible IP datagram, in case we use jumbograms
+
+struct string_table {
+  char *str;
+  int value;
+};
 
 enum encoding {
   NO_ENCODING = 0,
@@ -20,17 +32,19 @@ enum encoding {
   F32LE,
   AX25,
   F16LE,
+  OPUS_VOIP,       // Opus with APPLICATION_VOIP
+  F32BE,
+  F16BE,
+  MULAW,
+  ALAW,
   UNUSED_ENCODING, // Sentinel, not used
 };
+
 struct pt_table {
-  unsigned int samprate;
-  unsigned int channels;
+  int samprate;
+  int channels;
   enum encoding encoding;
 };
-
-extern struct pt_table PT_table[];
-extern int const Opus_pt; // Allow dynamic setting in the future
-extern int const AX25_pt;
 
 // Internal representation of RTP header -- NOT what's on wire!
 struct rtp_header {
@@ -97,10 +111,10 @@ enum sdes_type {
 struct rtcp_sdes {
   enum sdes_type type;
   uint32_t ssrc;
-  int mlen;
+  size_t mlen;
   char message[256];
 };
-#define PKTSIZE 65536 // Largest possible IP datagram, in case we use jumbograms
+
 // Incoming RTP packets
 // This should probably be extracted into a more general RTP library
 struct packet {
@@ -115,18 +129,46 @@ struct packet {
 void const *ntoh_rtp(struct rtp_header *,void const *);
 void *hton_rtp(void *, struct rtp_header const *);
 
-int add_pt(int type, unsigned int samprate, unsigned int channels, enum encoding encoding);
+int add_pt(int type, int samprate, int channels, enum encoding encoding);
 // Function to process incoming RTP packet headers
 // Returns number of samples dropped or skipped by silence suppression, if any
-int rtp_process(struct rtp_state *state,struct rtp_header const *rtp,int samples);
+int rtp_process(struct rtp_state *state,struct rtp_header const *rtp,size_t samples);
 
 // Generate RTCP source description segment
-uint8_t *gen_sdes(uint8_t *output,int bufsize,uint32_t ssrc,struct rtcp_sdes const *sdes,int sc);
+uint8_t *gen_sdes(uint8_t *output,size_t bufsize,uint32_t ssrc,struct rtcp_sdes const *sdes,int sc);
 // Generate RTCP bye segment
-uint8_t *gen_bye(uint8_t *output,int bufsize,uint32_t const *ssrcs,int sc);
+uint8_t *gen_bye(uint8_t *output,size_t bufsize,uint32_t const *ssrcs,int sc);
 // Generate RTCP sender report segment
-uint8_t *gen_sr(uint8_t *output,int bufsize,struct rtcp_sr const *sr,struct rtcp_rr const *rr,int rc);
+uint8_t *gen_sr(uint8_t *output,size_t bufsize,struct rtcp_sr const *sr,struct rtcp_rr const *rr,int rc);
 // Generate RTCP receiver report segment
-uint8_t *gen_rr(uint8_t *output,int bufsize,uint32_t ssrc,struct rtcp_rr const *rr,int rc);
+uint8_t *gen_rr(uint8_t *output,size_t bufsize,uint32_t ssrc,struct rtcp_rr const *rr,int rc);
+
+extern struct pt_table PT_table[];
+extern int const Opus_pt; // Allow dynamic setting in the future
+extern int const AX25_pt;
+
+// Allowable Opus block durations, millisec * 10
+extern int Opus_blocksizes[];
+extern int Opus_samprates[];
+// Codec helpers
+extern struct string_table Opus_application[];
+extern struct string_table Opus_signal[];
+
+int opus_bandwidth(char const **str,int code);
+char const *opus_application_string(int);
+int opus_bandwidth_to_code(int bw);
+bool legal_opus_size(int n);
+bool legal_opus_samprate(int n);
+
+int samprate_from_pt(int type);
+int channels_from_pt(int type);
+enum encoding encoding_from_pt(int type);
+int pt_from_info(int samprate,int channels,enum encoding);
+char const *encoding_string(enum encoding);
+enum encoding parse_encoding(char const *str);
+uint8_t float_to_mulaw(float fsample);
+float mulaw_to_float(uint8_t ulaw);
+uint8_t float_to_alaw(float fsample);
+float alaw_to_float(uint8_t alaw);
 
 #endif

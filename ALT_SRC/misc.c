@@ -1,10 +1,6 @@
 // Miscellaneous low-level routines for ka9q-radio
 // Copyright 2018, Phil Karn, KA9Q
 
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE 1
-#endif
-
 #include <math.h>
 #include <assert.h>
 #include <stdio.h>
@@ -18,22 +14,36 @@
 #include <libgen.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-#include <sys/resource.h>
 #include <pthread.h>
 #include <sys/mman.h>
-#include <sched.h>
 #include <errno.h>
 #include <locale.h>
 #include <fcntl.h>
+#include <stdatomic.h>
+#include <sys/timex.h>
+#include <stdbool.h>
+#if (defined(__i386__) || defined(__x86_64__)) && (defined(__SSE__) || defined(__AVX__))
+#include <immintrin.h>   // _mm_getcsr, _mm_setcsr
+#endif
 
 #ifndef NULL
 #define NULL ((void *)0)
 #endif
 
-#include "conf.h"
 #include "misc.h"
+#include "config_paths.h"
 
-char const *Libdir = LIBDIR;
+#ifndef PKGDATADIR
+#define PKGDATADIR "/usr/local/share/ka9q-radio"
+#endif
+
+#ifndef CONFDIR
+#define CONFDIR "/etc/radio"
+#endif
+
+char const *Pkgdatadir = PKGDATADIR;
+char const *Confdir = CONFDIR;
+
 
 // Return path to file which is part of the application distribution.
 // This allows to run the program either from build directory or from
@@ -41,20 +51,19 @@ char const *Libdir = LIBDIR;
 int dist_path(char *path,int path_len,const char *fname){
   if(path == NULL)
     return -1;
-  char cwd[PATH_MAX];
-  struct stat st;
+  struct stat st = {0};
 
   if(fname[0] == '/') {
     strlcpy(path, fname, path_len);
     return 0;
   }
-
-  dirname(realpath(App_path,cwd));
-  snprintf(path,path_len,"%s/%s",cwd,fname);
+  // first look in /etc/radio for local override
+  snprintf(path,path_len,"%s/%s",Confdir,fname);
   if(stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG)
     return 0;
 
-  snprintf(path,path_len,"%s/%s",Libdir,fname);
+  // Then look in packaged files /usr[/local]/share/ka9q-radio
+  snprintf(path,path_len,"%s/%s",Pkgdatadir,fname);
   if(stat(path, &st) == 0 && (st.st_mode & S_IFMT) == S_IFREG)
     return 0;
 
@@ -63,11 +72,11 @@ int dist_path(char *path,int path_len,const char *fname){
 
 // Fill buffer from pipe
 // Needed because reads from a pipe can be partial
-int pipefill(int const fd,void *buffer,int const cnt){
-  int i;
+ssize_t pipefill(int const fd,void *buffer,size_t const cnt){
+  size_t i;
   uint8_t *bp = buffer;
   for(i=0;i<cnt;){
-    int n = read(fd,bp+i,cnt-i);
+    ssize_t n = read(fd,bp+i,cnt-i);
     if(n < 0)
       return n;
     if(n == 0)
@@ -76,156 +85,6 @@ int pipefill(int const fd,void *buffer,int const cnt){
   }
   return i;
 
-}
-
-// Set realtime priority (if possible)
-static int Base_prio;
-static bool Message_shown;
-
-int default_prio(void){
-#ifdef __linux__
-  static int minprio = -1; // Save the extra system calls
-  static int maxprio = -1;
-  if(minprio == -1 || maxprio == -1){
-    minprio = sched_get_priority_min(SCHED_FIFO);
-    maxprio = sched_get_priority_max(SCHED_FIFO);
-  }
-  return (minprio + maxprio) / 2; // midway?
-#else
-  return 0;
-#endif
-}
-
-
-
-void realtime(int prio){
-  if(prio == 0)
-    return;
-
-#ifdef __linux__
-  struct sched_param param = {0};
-
-  param.sched_priority = prio;
-  if(sched_setscheduler(0,SCHED_FIFO|SCHED_RESET_ON_FORK,&param) == 0)
-    return; // Successfully set realtime
-  {
-    char name[25];
-    int err = errno;
-    if(!Message_shown && pthread_getname_np(pthread_self(),name,sizeof(name)) == 0){
-      Message_shown = true;
-      fprintf(stderr,"%s: sched_setscheduler failed, %s (%d)\n",name,strerror(err),err);
-    }
-  }
-#endif
-  (void)prio;
-  // As backup, decrease our niceness by 10
-  Base_prio = getpriority(PRIO_PROCESS,0);
-  errno = 0; // setpriority can return -1
-  int niceness = setpriority(PRIO_PROCESS,0,Base_prio - 10);
-  if(niceness != 0){
-    int err = errno;
-    char name[25];
-    memset(name,0,sizeof(name));
-    if(!Message_shown && pthread_getname_np(pthread_self(),name,sizeof(name)-1) == 0){
-      Message_shown = true;
-      fprintf(stderr,"%s: setpriority failed, %s (%d)\n",name,strerror(err),err);
-    }
-  }
-}
-
-// Drop back to normal priority, to avoid blocking a core when doing something time-consuming, like a FFT plan
-// Return true if we had previously been running at realtime, false otherwise
-
-int norealtime(void){
-#ifdef __linux__
-  if(sched_getscheduler(0) == SCHED_OTHER)
-    return 0; // Already normal
-
-  struct sched_param param = {0};
-  sched_getparam(0,&param);
-  int old_priority = param.sched_priority;
-
-  param.sched_priority = 0;
-  if(sched_setscheduler(0,SCHED_OTHER,&param) == 0)
-    return old_priority; // Successfully returned to normal
-
-  {
-    int err = errno; // in case getname changes it
-    char name[25] = {0};
-    if(!Message_shown && pthread_getname_np(pthread_self(),name,sizeof(name)) == 0){
-      Message_shown = true;
-      fprintf(stderr,"%s: sched_setscheduler failed, %s (%d)\n",name,strerror(err),err);
-    }
-  }
-#endif
-  // Try renicing to our base prio
-  errno = 0; // setpriority can return -1
-  int prio = getpriority(PRIO_PROCESS,0);
-  if(prio == Base_prio)
-    return prio; // Already normal niceness
-
-  prio = setpriority(PRIO_PROCESS,0,Base_prio);
-  if(prio == 0)
-    return prio; // Successfully returned to normal niceness
-  // Can it really fail when we're lowering?
-  if(!Message_shown){
-    int err = errno;
-    char name[25] = {0};
-    if(pthread_getname_np(pthread_self(),name,sizeof(name)-1) == 0){
-      Message_shown = true;
-      fprintf(stderr,"%s: setpriority failed to lower, %s (%d)\n",name,strerror(err),err);
-    }
-  }
-  return prio;  // Don't really know our state
-}
-
-// Stay on this CPU core
-bool Affinity = false;
-void stick_core(void){
-  if(!Affinity)
-    return;
-
-#if __linux__ // Not supported on macos, etc
-  char name[25] = {0};
-  pthread_t self = pthread_self();
-  if(pthread_getname_np(self,name,sizeof(name)-1) != 0)
-    fprintf(stderr,"getname(%ud) failed: %s\n",(unsigned int)self,strerror(errno));
-
-  int cpu = sched_getcpu();
-  cpu_set_t cpuset;
-  CPU_ZERO(&cpuset);
-  CPU_SET(cpu,&cpuset);
-  fprintf(stderr,"%s sched_setaffinity(pid=%u,cores=",name,(unsigned int)self);
-  // Any hyperthreading siblings?
-  char sysname[PATH_MAX] = {0};
-  snprintf(sysname,sizeof sysname,"/sys/devices/system/cpu/cpu%d/topology/thread_siblings_list",cpu);
-  FILE *fp = fopen(sysname,"r");
-  if(fp != NULL){
-    char corelist[128] = {0};
-    if(fgets(corelist,sizeof corelist,fp) != NULL){
-      char *string = corelist;
-      while(1){
-	char *ptr = NULL;
-	if((ptr = strsep(&string,",")) == NULL)
-	  break;
-	cpu = strtol(ptr,NULL,0);
-	CPU_SET(cpu,&cpuset);
-	fprintf(stderr," %d",cpu);
-      }
-    }
-    fclose(fp);
-    fp = NULL;
-  } else {
-    fprintf(stderr," %d",cpu);
-  }
-  fprintf(stderr,")\n");
-
-  if (sched_setaffinity(0, sizeof(cpuset), &cpuset) == -1) {
-    fprintf(stderr," failed: %s\n",strerror(errno));
-  } else {
-    fprintf(stderr,"\n");
-  }
-#endif
 }
 // Remove return or newline, if any, from end of string
 void chomp(char *s){
@@ -250,7 +109,38 @@ char *ensure_suffix(char const *str, char const *suffix){
     return NULL;
   return result;
 }
+static atomic_flag Leap_second_warning_logged = ATOMIC_FLAG_INIT;
 
+int64_t gps_time_ns(void){
+  struct timespec ts = {0};
+#ifdef CLOCK_TAI
+  // Try CLOCK_TAI and also query TAI-UTC offset
+  struct timex tx = {0};
+  if (clock_gettime(CLOCK_TAI, &ts) == 0 && adjtimex(&tx) != -1 && tx.tai >= 10) {
+    /* If CLOCK_TAI is supported, make sure it actually knows what the TAI-UTC offset is (it was never 0)
+       Strictly speaking this isn't TAI, which is defined from the epoch of 1 Jan 1958.
+       CLOCK_TAI counts seconds from the fictitious UNIX/POSIX epoch of 1 Jan 1970 00:00:00 UTC. (Fictitious because leap seconds
+       didn't start until 1972, and POSIX doesn't count them anyway.)
+       Since the system time is kept in pseudo-UTC, CLOCK_TAI returns system time plus the current TAI-UTC offset (+37 sec as of early 2026)
+       TAI is always 19 sec ahead of GPS
+       The GPS epoch (Sun 6 Jan 1980 00:00:00 UTC) was 3657 days after the UNIX epoch of Thu 1 Jan 1970 00:00:00 UTC), ignoring the 9
+       leap seconds between those two dates (because POSIX does)
+    */
+    ts.tv_sec -= UNIX_EPOCH;
+    ts.tv_sec -= TAI_GPS_OFFSET;
+    return ts.tv_sec * BILLION + ts.tv_nsec;
+  }
+#endif
+  // Need to add fallback code that consults an (updated) leap second table
+  if(Verbose && !atomic_flag_test_and_set_explicit(&Leap_second_warning_logged,memory_order_relaxed)){
+    // Log this message only once
+    fprintf(stderr,"Warning: system doesn't know leap second count; using %d sec, which will break with the next leap second\n",GPS_UTC_OFFSET);
+  }
+  clock_gettime(CLOCK_REALTIME, &ts);
+  ts.tv_sec -= UNIX_EPOCH;
+  ts.tv_sec += GPS_UTC_OFFSET;
+  return ts.tv_sec * BILLION + ts.tv_nsec;
+}
 
 void normalize_time(struct timespec *x){
   // Most common cases first
@@ -274,9 +164,6 @@ void normalize_time(struct timespec *x){
     }
   }
 }
-
-
-
 char const *Days[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat" };
 char const *Months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec" };
 
@@ -284,23 +171,19 @@ char const *Months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","O
 char *format_gpstime(char *result,int len,int64_t t){
   return format_utctime(result,len,t + BILLION * (UNIX_EPOCH - GPS_UTC_OFFSET));
 }
-
 char *format_gpstime_iso8601(char *result,int len,int64_t t){
   return format_utctime_iso8601(result,len,t + BILLION * (UNIX_EPOCH - GPS_UTC_OFFSET));
 }
-
-
 // Format, as UTC, a time measured in nanoseconds from the UNIX epoch
 char *format_utctime(char *result,int len,int64_t t){
-  lldiv_t const ut = lldiv(t,BILLION);
+  time_t utime = t / BILLION;
+  int t_usec = (int)((t % BILLION) / 1000); // ns to us
 
-  time_t utime = ut.quot;
-  int t_usec = ut.rem / 1000;
   if(t_usec < 0){
     t_usec += 1000000;
     utime -= 1;
   }
-  struct tm tm;
+  struct tm tm = {0};
   gmtime_r(&utime,&tm);
   // Mon Feb 26 2018 14:40:08.123456 UTC
   snprintf(result,len,"%s %02d %s %4d %02d:%02d:%02d.%06d UTC",
@@ -315,19 +198,17 @@ char *format_utctime(char *result,int len,int64_t t){
 
   return result;
 }
-
+// Format a time in ns since the Unix epoch into ISO 8601, eg, 2018-02-26T14:40:08.123456Z
 char *format_utctime_iso8601(char *result,int len,int64_t t){
-  lldiv_t const ut = lldiv(t,BILLION);
+  time_t utime = t / BILLION;
+  int t_usec = (int)((t % BILLION) / 1000);
 
-  time_t utime = ut.quot;
-  int t_usec = ut.rem / 1000;
   if(t_usec < 0){
     t_usec += 1000000;
     utime -= 1;
   }
-  struct tm tm;
+  struct tm tm = {0};
   gmtime_r(&utime,&tm);
-  // 2018-02-26T14:40:08.123456Z
   snprintf(result,len,"%04d-%02d-%02dT%02d:%02d:%02d.%06dZ",
 	   tm.tm_year+1900,
 	   tm.tm_mon+1,
@@ -359,48 +240,41 @@ char *ftime(char * result,int size,int64_t t){
   t -= 3600 * hr;
 
   // Show hours and the hour:minute colon only if hr > 0
-  int r;
+  int r = 0;
   if(hr > 0)
-    r = snprintf(cp,size,"%3lld:",(long long)hr);
-  else
-    r = snprintf(cp,size,"    ");
+    r = snprintf(cp,size,"%lld:",(long long)hr);
 
   if(r < 0)
     return NULL;
   cp += r;
   size -= r;
 
-  int const mn = t / 60; // minutes is limited to 0-59
+  int64_t const mn = t / 60; // minutes is limited to 0-59
   t -= mn * 60;
   assert(mn < 60);
   assert(t < 60);
 
-  r = 3;
+  r = 0;
   if(hr > 0)
     // hours field is present, show minutes with leading zero
-    r = snprintf(cp,size,"%02d:",mn);
+    r = snprintf(cp,size,"%02lld:",(long long)mn);
   else if(mn > 0)
     // Hours zero, show minute without leading 0
-    r = snprintf(cp,size,"%2d:",mn);
-  else
-    r = snprintf(cp,size,"   ");
+    r = snprintf(cp,size,"%lld:",(long long)mn);
 
-  assert(r == 3);
   if(r < 0)
     return NULL;
   cp += r;
   size -= r;
 
 
+  r = 0;
   if(hr > 0 || mn > 0)
   // Hours or minutes are nonzero, show seconds with leading 0
     r = snprintf(cp,size,"%02lld",(long long)t);
   else if(t > 0)
-    r = snprintf(cp,size,"%2lld",(long long)t);
-  else
-    r = snprintf(cp,size,"  "); // All zero, emit all blanks
+    r = snprintf(cp,size,"%lld",(long long)t);
 
-  assert(r == 2);
   if(r < 0)
     return NULL;
 
@@ -415,57 +289,84 @@ char *ftime(char * result,int size,int64_t t){
 // 12g345 (12.345 GHz)
 // If no g/m/k and number is too small, make a heuristic guess
 // NB! This assumes radio covers 100 kHz - 2 GHz; should make more general
-double parse_frequency(char const *s,bool heuristics){
-  char * const ss = alloca(strlen(s)+1);
+rational_64 parse_frequency_rational(char const *s,bool heuristics){
+  // Make lower case copy of input string
+  unsigned char * const ss = alloca(strlen(s)+1);
   {
-    size_t i;
-    for(i=0;i<strlen(s);i++)
-      ss[i] = tolower(s[i]);
+    size_t i,len;
+    len = strlen(s);
+    for(i=0; i<len; i++)
+      ss[i] = (unsigned char)tolower((unsigned char)s[i]);
 
     ss[i] = '\0';
   }
-  // Don't hardwire the decimal point, use the current locale
-  char decimal = '.';
-  struct lconv *lc = localeconv();
-  if(lc != NULL && lc->decimal_point != NULL && strlen(lc->decimal_point) > 0)
-    decimal = lc->decimal_point[0];
-
-  double mult = 1;
-  // k, m or g in place of decimal point indicates scaling by 1k, 1M or 1G
-  // h (hertz) means unity scaling; it can be used as a locale-independent
-  // decimal point
-  char *sp = NULL;
-  if((sp = strchr(ss,'g')) != NULL){
-    mult = 1e9;
-    *sp = decimal;
-  } else if((sp = strchr(ss,'m')) != NULL){
-    mult = 1e6;
-    *sp = decimal;
-  } else if((sp = strchr(ss,'k')) != NULL){
-    mult = 1e3;
-    *sp = decimal;
-  } else if((sp = strchr(ss,'h')) != NULL){
-    mult = 1;
-    *sp = decimal;
-  } else if((sp = strchr(ss,decimal)) != NULL){
-    // Disable heuristic if explicitly given
+  bool radix_seen = false;
+  bool sign = false;
+  int mult = 0;
+  uint64_t num = 0;
+  uint64_t den = 1;
+  uint64_t const cutoff = UINT64_MAX / 10; // largest before overflow when multiplying by 10
+  for(unsigned char const *cp = ss; *cp != '\0'; cp++){
+    unsigned char c = *cp;
+    if(c == '-'){
+      sign = true;
+    } else if(isdigit(c)){
+      unsigned const d = c - '0';
+      if(num < cutoff || (num == cutoff && d <= UINT64_MAX % 10)){
+	num = num * 10 + d;
+	if(radix_seen)
+	  mult--;
+      } else
+	goto fail;
+    } else if(c == 'g'){
+      mult += 9;
+      radix_seen = true;
+    } else if(c == 'm'){
+      mult += 6;
+      radix_seen = true;
+    } else if(c == 'k'){
+      mult += 3;
+      radix_seen = true;
+    } else if(c == '.' || c == ','){
+      radix_seen = true;
+    }
+    // unknown chars are ignored
   }
-  char *endptr = NULL;
-  double f = strtod(ss,&endptr);
-  if(endptr == ss || f == 0)
-    return 0; // Empty entry, or nothing decipherable
-
-  if(!heuristics || sp != NULL || f >= 1e5) // If multiplier explicitly given, or frequency >= 100 kHz (lower limit), return as-is
-    return f * mult;
-
-  // no radix specified & heuristics enabled: empirically guess kHz or MHz
-  if(f < 500)         // Could be kHz or MHz, arbitrarily assume MHz
-    return f * 1e6;
-  else if(f < 100000)
-    return f * 1e3;         // assume kHz
-  else return f;
+  if(radix_seen){
+    for(int i=0; i < mult; i++){
+      if(num > cutoff)
+	goto fail;
+      num *= 10;
+    }
+    for(int i = 0; i > mult; i--){
+      if(den > cutoff)
+	goto fail;
+      den *= 10;
+    }
+  } else if(heuristics){
+    if(num < 500)
+      num *= 1000000; // assume megahertz, won't overflow
+    else if(num < 100000)
+      num *= 1000;    // assume kilohertz, won't overflow
+  }
+  // Form result
+  if(num > INT64_MAX)
+    goto fail; // must allow room for sign bit
+  rational_64 result = {.num = (int64_t)num, .den = den};
+  result = rational_reduce_64(result);
+  if(sign)
+    result.num = -result.num;
+  return result;
+ fail:;
+  {
+    rational_64 result = {0}; // zero denom is invalid
+    return result;
+  }
 }
-
+double parse_frequency(char const *s, bool heuristics){
+  rational_64 r = parse_frequency_rational(s,heuristics);
+  return (double)r.num / (double)r.den;
+}
 // Return smallest integer greater than N with no factors > 7
 // Useful for determining efficient FFT sizes
 uint32_t nextfastfft(uint32_t n){
@@ -486,7 +387,7 @@ uint32_t nextfastfft(uint32_t n){
       }
     }
   }
-  return result;
+  return (uint32_t)result;
 }
 
 // round up to next power of 2
@@ -512,10 +413,10 @@ uint32_t round2(uint32_t v){
 // See Wikipedia article on "Rice Distribution"
 
 // Modified Bessel function of the 0th kind
-float i0(float const z){
-  float const t = 0.25 * z * z;
-  float sum = 1 + t;
-  float term = t;
+double i0(double const z){
+  double const t = 0.25 * z * z;
+  double sum = 1 + t;
+  double term = t;
   for(int k=2; k<40; k++){
     term *= t/(k * k);
     sum += term;
@@ -526,10 +427,10 @@ float i0(float const z){
 }
 
 // Modified Bessel function of first kind
-float i1(float const z){
-  float const t = 0.25 * z * z;
-  float term = 0.5 * t;
-  float sum = 1 + term;
+double i1(double const z){
+  double const t = 0.25 * z * z;
+  double term = 0.5 * t;
+  double sum = 1 + term;
 
   for(int k=2; k<40; k++){
     term *= t / (k * (k+1));
@@ -539,16 +440,16 @@ float i1(float const z){
   }
   return 0.5 * z * sum;
 }
-float xi(float thetasq){
+double xi(double thetasq){
 
-  float t = (2 + thetasq) * i0(0.25 * thetasq) + thetasq * i1(0.25 * thetasq);
+  double t = (2 + thetasq) * i0(0.25 * thetasq) + thetasq * i1(0.25 * thetasq);
   t *= t;
-  return 2 + thetasq - (0.125 * M_PI) * expf(-0.5 * thetasq) * t;
+  return 2 + thetasq - (0.125 * M_PI) * exp(-0.5 * thetasq) * t;
 }
 
 
 // Given apparent signal-to-noise power ratio, return corrected value
-float fm_snr(float r){
+double fm_snr(double r){
 
   if(r <= M_PI / (4 - M_PI)) // shouldn't be this low even on pure noise
     return 0;
@@ -556,11 +457,11 @@ float fm_snr(float r){
   if(r > 100) // 20 dB
     return r; // Formula blows up for large SNR, and correction is tiny anyway
 
-  float thetasq = r;
+  double thetasq = r;
   for(int i=0;i < 10; i++){
-    float othetasq = thetasq;
+    double othetasq = thetasq;
     thetasq = xi(thetasq) * (1+r) - 2;
-    if(fabsf(thetasq - othetasq) <= 0.01)
+    if(fabs(thetasq - othetasq) <= 0.01)
       break; // converged
   }
   return thetasq;
@@ -569,7 +470,7 @@ float fm_snr(float r){
 // Simple non-crypto hash function
 // Adapted from https://en.wikipedia.org/wiki/PJW_hash_function
 // This needs replacing -- last 4 bits are usually 0xc because the last character of the DNS name is usually a '.'
-uint32_t ElfHash(const uint8_t *s,int length){
+uint32_t ElfHash(const uint8_t *s,size_t length){
     uint32_t h = 0;
     while(length-- > 0){
         h = (h << 4) + *s++;
@@ -586,7 +487,7 @@ uint32_t ElfHashString(const char *s){
 }
 
 // FNV-1 hash (https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function)
-uint32_t fnv1hash(const uint8_t *s,int length){
+uint32_t fnv1hash(const uint8_t *s,size_t length){
   uint32_t hash = 0x811c9dc5;
   while(length-- > 0){
     hash *= 0x01000193;
@@ -675,22 +576,6 @@ size_t round_to_hugepage(size_t size){
     pages++;
   return pages * hugepagesize;
 }
-// Custom version of malloc that aligns to a cache line
-// This is 64 bytes on most modern machines, including the x86 and the ARM 2711 (Pi 4)
-// This is stricter than a float complex or double complex, which is required by fftwf/fftw
-void *lmalloc(size_t size){
-  void *ptr;
-  int r;
-  if((r = posix_memalign(&ptr,64,size)) == 0){
-    assert(ptr != NULL);
-    return ptr;
-  }
-  errno = r;
-  assert(false);
-  return NULL;
-}
-
-
 // Special version of malloc that allocates a mirrored block
 // The block first appears normally, then is followed by a duplicate mapping
 // Very useful for circular buffers that must be accessed sequentially, without wraparound
@@ -788,8 +673,9 @@ void *mirror_alloc(size_t size){
   uint8_t *mirror = mmap(base + size,size, PROT_READ|PROT_WRITE, MAP_FIXED|MAP_SHARED, fd, 0);
   if(mirror != base + size){
     perror("mirror_alloc 3rd mmap");
+    close(fd);
     munmap(base,size * 2);
-    base = NULL;
+    return NULL;
   }
   close(fd); // No longer needed after all memory maps are in place
   return base;
@@ -812,7 +698,6 @@ void *mirror_alloc(size_t size){
     close(fd);
     return NULL;
   }
-
   // Reserve virtual space for buffer + mirror
   uint8_t *base = mmap(NULL,size * 2, PROT_NONE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0); // Retry normal
   if(base == MAP_FAILED){
@@ -832,7 +717,8 @@ void *mirror_alloc(size_t size){
   if(mirror != base + size){
     perror("mirror_alloc second mmap");
     munmap(base,size * 2);
-    base = NULL;
+    close(fd);
+    return NULL;
   }
   close(fd); // No longer needed after all memory maps are in place
   return base;
@@ -848,8 +734,35 @@ void mirror_free(void **p,size_t size){
   *p = NULL; // Nail pointer
 }
 
-#undef DROP_ENABLE
+void enable_ftz_daz(void){
+#if (defined(__i386__) || defined(__x86_64__)) && (defined(__SSE__) || defined(__AVX__))
+  unsigned int csr = _mm_getcsr();
+  csr |= (1u << 15);   // FTZ
+  csr |= (1u << 6);    // DAZ
+  _mm_setcsr(csr);
+#elif defined(__aarch64__)
+  unsigned long fpcr;
+  __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+  fpcr |= (1ul << 24);          // FZ bit
+  __asm__ volatile("msr fpcr, %0" :: "r"(fpcr));
+#endif
+}
 
+void disable_ftz_daz(void){
+#if (defined(__i386__) || defined(__x86_64__)) && (defined(__SSE__) || defined(__AVX__))
+  unsigned int csr = _mm_getcsr();
+  csr &= ~(1u << 15);
+  csr &= ~(1u << 6);
+  _mm_setcsr(csr);
+#elif defined(__aarch64__)
+  unsigned long fpcr;
+  __asm__ volatile("mrs %0, fpcr" : "=r"(fpcr));
+  fpcr &= ~(1ul << 24);          // FZ bit
+  __asm__ volatile("msr fpcr, %0" :: "r"(fpcr));
+#endif
+}
+
+#undef DROP_ENABLE
 #if DROP_ENABLE
 static size_t linesize(){
 #ifdef _SC_LEVEL1_DCACHE_LINESIZE
@@ -891,5 +804,17 @@ void drop_cache(void *mem,size_t bytes){
 void drop_cache(void *mem,size_t bytes){
   (void)mem;
   (void)bytes;
+}
+#endif
+#if defined(__i386__) || defined(__x86_64__)
+#include <xmmintrin.h>
+
+enum { MXCSR_EX_FLAGS = 0x3Fu, MXCSR_DE = 1u<<1, MXCSR_UE = 1u<<4 };
+
+uint32_t mxcsr_get_and_clear_flags(void){
+    uint32_t x = _mm_getcsr();
+    uint32_t flags = x & MXCSR_EX_FLAGS;
+    _mm_setcsr(x & ~MXCSR_EX_FLAGS);
+    return flags;
 }
 #endif

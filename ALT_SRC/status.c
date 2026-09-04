@@ -1,7 +1,5 @@
 // Low-level encode/decode routines for TLV status packets from/to ka9q-radio's radiod
 // Copyright 2020-2023 Phil Karn, KA9Q
-
-#define _GNU_SOURCE 1
 #include <assert.h>
 #include <string.h>
 #if defined(linux)
@@ -9,23 +7,13 @@
 #endif
 #include <math.h>
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <sys/time.h>
 #include <stdlib.h>
 #include <stdint.h>
-#include <netdb.h>
 
 #include "misc.h"
 #include "status.h"
 #include "radio.h"
-
-union result {
-  uint64_t ll;
-  uint32_t l;
-  float f;
-  double d;
-};
-
 
 // Encode 64-bit integer, big endian, leading zeroes suppressed
 // The nice thing about big-endian encoding with suppressed leading zeroes
@@ -34,7 +22,7 @@ union result {
 int encode_int64(uint8_t **buf,enum status_type type,uint64_t x){
   uint8_t *cp = *buf;
 
-  *cp++ = type;
+  *cp++ = (uint8_t)type;
 
   if(x == 0){
     // Compress zero value to zero length
@@ -43,12 +31,12 @@ int encode_int64(uint8_t **buf,enum status_type type,uint64_t x){
     return 2;
   }
 
-  int len = sizeof(x);
+  int len = sizeof x;
   while(len > 0 && ((x >> 56) == 0)){
     x <<= 8;
     len--;
   }
-  *cp++ = len;
+  *cp++ = (uint8_t)len;
 
   for(int i=0; i<len; i++){
     *cp++ = x >> 56;
@@ -69,19 +57,23 @@ int encode_eol(uint8_t **buf){
   return 1;
 }
 
+int encode_bool(uint8_t **buf,enum status_type type,bool x){
+  return encode_byte(buf,type,(uint8_t)x);
+}
+
 int encode_byte(uint8_t **buf,enum status_type type,uint8_t x){
   uint8_t *cp = *buf;
-  *cp++ = type;
+  *cp++ = (uint8_t)type;
   if(x == 0){
     // Compress zero value to zero length
     *cp++ = 0;
     *buf = cp;
     return 2;
   }
-  *cp++ = sizeof(x);
+  *cp++ = sizeof x;
   *cp++ = x;
   *buf = cp;
-  return 2+sizeof(x);
+  return 2 + sizeof x;
 }
 
 int encode_int16(uint8_t **buf,enum status_type type,uint16_t x){
@@ -98,49 +90,51 @@ int encode_int(uint8_t **buf,enum status_type type,int x){
 
 
 // Floating types are also byte-swapped to big-endian order
-int encode_float(uint8_t **buf,enum status_type type,float x){
+// Intentionally accepts a double so callers don't need to cast them
+int encode_float(uint8_t **buf,enum status_type type,double x){
   if(isnan(x))
     return 0; // Never encode a NAN
 
-  union result r;
-  r.f = x;
-  return encode_int32(buf,type,r.l);
+  float xx = (float)x;
+  uint32_t r;
+  memcpy(&r,&xx,sizeof r);
+  return encode_int32(buf,type,r);
 }
 
 int encode_double(uint8_t **buf,enum status_type type,double x){
   if(isnan(x))
     return 0; // Never encode a NAN
 
-  union result r;
-  r.d = x;
-  return encode_int64(buf,type,r.ll);
+  uint64_t r;
+  memcpy(&r,&x,sizeof r);
+  return encode_int64(buf,type,r);
 }
 
 // Encode byte string without byte swapping
-int encode_string(uint8_t **bp,enum status_type const type,void const *buf,unsigned int const buflen){
+size_t encode_string(uint8_t **bp,enum status_type const type,void const *buf,size_t const buflen){
   uint8_t const *orig_bpp = *bp;
   uint8_t *cp = *bp;
-  *cp++ = type;
+  *cp++ = (uint8_t)type;
 
   if(buflen < 128){
     // send length directly
-    *cp++ = buflen;
+    *cp++ = (uint8_t)buflen;
   } else if(buflen < 65536){
     // Length is 2 bytes, big endian
     *cp++ = 0x80 | 2;
-    *cp++ = buflen >> 8;
-    *cp++ = buflen;
+    *cp++ = (uint8_t)(buflen >> 8);
+    *cp++ = (uint8_t)buflen;
   } else if(buflen < 16777216){
     *cp++ = 0x80 | 3;
-    *cp++ = buflen >> 16;
-    *cp++ = buflen >> 8;
-    *cp++ = buflen;
+    *cp++ = (uint8_t)(buflen >> 16);
+    *cp++ = (uint8_t)(buflen >> 8);
+    *cp++ = (uint8_t)buflen;
   } else { // Handle more than 4 GB??
     *cp++ = 0x80 | 4;
-    *cp++ = buflen >> 24;
-    *cp++ = buflen >> 16;
-    *cp++ = buflen >> 8;
-    *cp++ = buflen;
+    *cp++ = (uint8_t)(buflen >> 24);
+    *cp++ = (uint8_t)(buflen >> 16);
+    *cp++ = (uint8_t)(buflen >> 8);
+    *cp++ = (uint8_t)buflen;
   }
   memcpy(cp,buf,buflen);
   cp += buflen;
@@ -152,43 +146,40 @@ int encode_string(uint8_t **bp,enum status_type const type,void const *buf,unsig
 // size = number of floats
 // Sent in big endian order just like other floats
 // Because it can be very long, handle large sizes
-int encode_vector(uint8_t **bp,enum status_type type,float const *array,int size){
+size_t encode_vector(uint8_t **bp,enum status_type type,float const *array,size_t size){
   uint8_t const *orig_bp = *bp;
   uint8_t *cp = *bp;
-  *cp++ = type;
+  *cp++ = (uint8_t)type;
 
-  int const bytes = sizeof(*array) * size; // Number of bytes in data
+  size_t const bytes = size * sizeof *array; // Number of bytes in data
   if(bytes < 128){
-    *cp++ = bytes;    // Send length directly
+    *cp++ = (uint8_t)bytes;    // Send length directly
   } else if(bytes < 65536){
     *cp++ = 0x80 | 2; // length takes 2 bytes
-    *cp++ = bytes >> 8;
-    *cp++ = bytes;
+    *cp++ = (uint8_t)(bytes >> 8);
+    *cp++ = (uint8_t)bytes;
   } else if(bytes < 16777216){
     *cp++ = 0x80 | 3;
-    *cp++ = bytes >> 16;
-    *cp++ = bytes >> 8;
-    *cp++ = bytes;
+    *cp++ = (uint8_t)(bytes >> 16);
+    *cp++ = (uint8_t)(bytes >> 8);
+    *cp++ = (uint8_t)bytes;
   } else {
     *cp++ = 0x80 | 4;
-    *cp++ = bytes >> 24;
-    *cp++ = bytes >> 16;
-    *cp++ = bytes >> 8;
-    *cp++ = bytes;
+    *cp++ = (uint8_t)(bytes >> 24);
+    *cp++ = (uint8_t)(bytes >> 16);
+    *cp++ = (uint8_t)(bytes >> 8);
+    *cp++ = (uint8_t)bytes;
   }
   // Encode the individual array elements
   // Right now they're DC....maxpositive maxnegative...minnegative
-  for(int i=0;i < size;i++){
-    // Swap but don't bother compressing leading zeroes for now
-    union {
-      uint32_t i;
-      float f;
-    } foo;
-    foo.f = array[i];
-    *cp++ = foo.i >> 24;
-    *cp++ = foo.i >> 16;
-    *cp++ = foo.i >> 8;
-    *cp++ = foo.i;
+  for(size_t i=0;i < size;i++){
+    // Byte Swap but don't bother compressing leading zeroes for now
+    uint32_t foo;
+    memcpy(&foo,&array[i],sizeof foo);
+    *cp++ = (uint8_t)(foo >> 24);
+    *cp++ = (uint8_t)(foo >> 16);
+    *cp++ = (uint8_t)(foo >> 8);
+    *cp++ = (uint8_t)foo;
   }
   *bp = cp;
   return cp - orig_bp;
@@ -202,8 +193,10 @@ int encode_vector(uint8_t **bp,enum status_type type,float const *array,int size
 // OTOH, the caller doesn't have to figure out a buffer size anymore
 char *decode_string(uint8_t const *cp,int optlen){
   char *result = malloc(optlen+1);
-  if(result != NULL)
-    memcpy(result,cp,optlen);
+  assert(result != NULL);
+  if(result == NULL)
+    return NULL;
+  memcpy(result,cp,optlen);
   result[optlen] = '\0'; // force null termination
   return result;
 }
@@ -239,30 +232,39 @@ bool decode_bool(uint8_t const *cp,int len){
 int decode_int(uint8_t const *cp,int len){
   return decode_int64(cp,len) & UINT_MAX; // mask to the size of an int
 }
-
-
-float decode_float(uint8_t const *cp,int len){
+// Will recognize a double as long as no more than 3 of the leading bytes are zeroes and are compressed away
+// Note this returns double.
+// The only compressed doubles that could masquerade as floats are:
+// +0, which encodes into 0 bytes (same as a zero integer) as an important special case.
+// or the smallest positive denormals (biased 10-bit exponent == 0 *and* the top 21 bits of the mantissa
+// (Recall denormals are where the hidden bit to the left of the mantissa is a 0 instead of the usual implied 1)
+// If misinterpreted as a compressed float the rightmost 32 bits of the double's mantissa could re-emerge as a totally
+// a bogus 32-bit float that might be very large
+// Denormals aren't very common but still it's best to be careful
+double decode_float(uint8_t const *cp,int len){
   if(len == 0)
     return 0;
 
-  if(len == 8)
-    return (float)decode_double(cp,len);
+  if(len > (int)sizeof(float))
+    return decode_double(cp,len); // seems safe, just in case it's really a double
 
-  union result r;
-  r.ll = decode_int64(cp,len);
-  return r.f;
+  uint32_t r = decode_int64(cp,len);
+  float f;
+  memcpy(&f, &r, sizeof f);
+  return (double)f;
 }
 
+// No float can masquerade as a double except as a very small positive denormal
+// even if the float was very large to start with
+// So always interpret as a possibly compressed double
 double decode_double(uint8_t const *cp,int len){
   if(len == 0)
     return 0;
 
-  if(len == 4)
-    return (double)decode_float(cp,len);
-
-  union result r;
-  r.ll = decode_int64(cp,len);
-  return r.d;
+  uint64_t r = decode_int64(cp,len);
+  double f;
+  memcpy(&f, &r, sizeof f);
+  return f;
 }
 
 // The Linux/UNIX socket data structures are a real mess...
@@ -275,19 +277,19 @@ int encode_socket(uint8_t **buf,enum status_type type,void const *sock){
   switch(sin->sin_family){
   case AF_INET:
     optlen = 6;
-    *bp++ = type;
-    *bp++ = optlen;
+    *bp++ = (uint8_t)type;
+    *bp++ = (uint8_t)optlen;
     memcpy(bp,&sin->sin_addr.s_addr,4); // Already in network order
     bp += 4;
     memcpy(bp,&sin->sin_port,2);
     bp += 2;
     break;
   case AF_INET6:
-    optlen = 10;
-    *bp++ = type;
-    *bp++ = optlen;
-    memcpy(bp,&sin6->sin6_addr,8);
-    bp += 8;
+    optlen = 18;
+    *bp++ = (uint8_t)type;
+    *bp++ = (uint8_t)optlen;
+    memcpy(bp,&sin6->sin6_addr,16);
+    bp += 16;
     memcpy(bp,&sin6->sin6_port,2);
     bp += 2;
     break;
@@ -311,10 +313,10 @@ struct sockaddr *decode_socket(void *sock,uint8_t const *val,int optlen){
     memcpy(&sin->sin_addr.s_addr,val,4);
     memcpy(&sin->sin_port,val+4,2);
     return sock;
-  } else if(optlen == 10){
+  } else if(optlen == 18){
     sin6->sin6_family = AF_INET6;
-    memcpy(&sin6->sin6_addr,val,8);
-    memcpy(&sin6->sin6_port,val+8,2);
+    memcpy(&sin6->sin6_addr,val,16);
+    memcpy(&sin6->sin6_port,val+16,2);
     return sock;
   }
   return NULL;

@@ -1,14 +1,17 @@
-// Real Time Protocol support routines and tables
-
+// Real Time Protocol support routines and tables for ka9q-radio
+// Copyright 2026 Phil Karn, KA9Q
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <string.h>
 #include <netinet/in.h>
+#include <opus/opus.h>
+#include <math.h>
 #include "rtp.h"
 
 struct pt_table PT_table[128] = {
-{ 0, 0, 0 }, // 0
+{ 8000, 1, MULAW }, // 0
 { 0, 0, 0 }, // 1
 { 0, 0, 0 }, // 2
 { 0, 0, 0 }, // 3
@@ -16,7 +19,7 @@ struct pt_table PT_table[128] = {
 { 0, 0, 0 }, // 5
 { 0, 0, 0 }, // 6
 { 0, 0, 0 }, // 7
-{ 0, 0, 0 }, // 8
+{ 8000, 1, ALAW }, // 8
 { 0, 0, 0 }, // 9
 { 44100, 2, S16BE }, // 10
 { 44100, 1, S16BE }, // 11
@@ -108,7 +111,7 @@ struct pt_table PT_table[128] = {
 { 0, 0, 0 }, // 97
 { 0, 0, 0 }, // 98
 { 0, 0, 0 }, // 99
-{ 0, 0, 0 }, // 100
+{ 8000, 0, 0 }, // 100  defacto owned by RTP Event
 { 0, 0, 0 }, // 101
 { 0, 0, 0 }, // 102
 { 0, 0, 0 }, // 103
@@ -138,7 +141,6 @@ struct pt_table PT_table[128] = {
 { 0, 0, 0 }, // 127
 };
 
-
 #define AX25_PT (96)  // NON-standard payload type for my raw AX.25 frames - clean this up and remove
 #define OPUS_PT (111) // Hard-coded NON-standard payload type for OPUS (should be dynamic with sdp)
 
@@ -149,13 +151,13 @@ int const AX25_pt = AX25_PT;
 // Add an encoding to the RTP payload type table
 // The mappings are typically extracted from a radiod status channel and kept in a table so they can
 // be changed midstream without losing anything
-int add_pt(int type, unsigned int samprate, unsigned int channels, enum encoding encoding){
+int add_pt(int type, int samprate, int channels, enum encoding encoding){
   if(encoding == NO_ENCODING)
     return -1;
 
   if(encoding == OPUS){
     // Force Opus to fixed values
-    samprate = 48000;
+    samprate = OPUS_SAMPRATE;
     channels = 2;
   }
   if(type >= 0 && type < 128){
@@ -213,7 +215,7 @@ void *hton_rtp(void * const data, struct rtp_header const * const rtp){
 // Process sequence number and timestamp in incoming RTP header:
 // count dropped and duplicated packets, but it gets confused
 // Determine timestamp jump from the next expected one
-int rtp_process(struct rtp_state * const state,struct rtp_header const * const rtp,int const sampcnt){
+int rtp_process(struct rtp_state * const state,struct rtp_header const * const rtp,size_t const sampcnt){
   if(rtp->ssrc != state->ssrc){
     // Normally this will happen only on the first packet in a session since
     // the caller demuxes the SSRC to multiple instances.
@@ -241,8 +243,8 @@ int rtp_process(struct rtp_state * const state,struct rtp_header const * const r
   }
   state->seq = rtp->seq + 1;
 
-  int const time_step = (int32_t)(rtp->timestamp - state->timestamp);
-  state->timestamp = rtp->timestamp + sampcnt;
+  int const time_step = (int)(rtp->timestamp - state->timestamp);
+  state->timestamp = (uint32_t)(rtp->timestamp + sampcnt);
   return time_step;
 }
 int samprate_from_pt(int const type){
@@ -265,14 +267,14 @@ enum encoding encoding_from_pt(int const type){
 // Dynamically create a new one if not found
 // Should lock the table when it's modified
 // Use for sending only! Receivers need to build a table for each sender
-int pt_from_info(unsigned int samprate,unsigned int channels,enum encoding encoding){
+int pt_from_info(int samprate,int channels,enum encoding encoding){
   if(samprate <= 0 || channels <= 0 || channels > 2 || encoding == NO_ENCODING || encoding >= UNUSED_ENCODING)
     return -1;
 
   if(encoding == OPUS){
-    // Force Opus to fixed values
+    // Force Opus to fixed values; merges all variations to single PT
     channels = 2;
-    samprate = 48000;
+    samprate = OPUS_SAMPRATE;
   }
 
   // Search table for existing entry, otherwise create new entry
@@ -280,7 +282,11 @@ int pt_from_info(unsigned int samprate,unsigned int channels,enum encoding encod
     if(PT_table[type].samprate == samprate && PT_table[type].channels == channels && PT_table[type].encoding == encoding)
       return type;
   }
-  for(int type=96; type < 128; type++){ // Allocate a new type in the dynamic range
+  // The dynamic pool starts at 96 but sometimes I need more than are available during testing with lots of encoder/
+  // sample rate/channel combinations. 77-95 is unassigned, so I'm squatting. I do avoid 100 since it's de-facto RTP Event
+  for(int type=77; type < 128; type++){ // Allocate a new type in the dynamic range
+    if(type == 100)
+      continue; // avoid this one, de-facto RTP Event
     if(PT_table[type].samprate == 0){
       // allocate it
       if(add_pt(type,samprate,channels,encoding) == -1)
@@ -293,7 +299,6 @@ int pt_from_info(unsigned int samprate,unsigned int channels,enum encoding encod
 char const *encoding_string(enum encoding e){
   switch(e){
   default:
-  case NO_ENCODING:
     return "none";
   case S16LE:
     return "s16le";
@@ -301,12 +306,22 @@ char const *encoding_string(enum encoding e){
     return "s16be";
   case OPUS:
     return "opus";
+  case OPUS_VOIP:
+    return "opus-voip";
   case F32LE:
     return "f32le";
+  case F32BE:
+    return "f32be";
   case AX25:
     return "ax.25";
   case F16LE:
     return "f16le";
+  case F16BE:
+    return "f16be";
+  case MULAW:
+    return "pcmu";
+  case ALAW:
+    return "pcma";
   }
 }
 enum encoding parse_encoding(char const *str){
@@ -316,12 +331,223 @@ enum encoding parse_encoding(char const *str){
     return S16LE;
   else if(strcasecmp(str,"f32") == 0 || strcasecmp(str,"float") == 0 || strcasecmp(str,"f32le") == 0)
     return F32LE;
+  else if(strcasecmp(str,"f32be") == 0)
+    return F32BE;
   else if(strcasecmp(str,"f16") == 0 || strcasecmp(str,"f16le") == 0)
     return F16LE;
+  else if(strcasecmp(str,"f16be") == 0)
+    return F16BE;
+  else if(strcasecmp(str,"opus-voip") == 0)
+    return OPUS_VOIP;
   else if(strcasecmp(str,"opus") == 0)
     return OPUS;
   else if(strcasecmp(str,"ax25") == 0 || strcasecmp(str,"ax.25") == 0)
     return AX25;
+  else if (strcasecmp(str, "ulaw") == 0 || strcasecmp(str, "mulaw") == 0 || strcasecmp(str,"μlaw") == 0 || strcasecmp(str,"pcmu") == 0)
+    return MULAW;
+  else if (strcasecmp(str, "alaw") == 0 || strcasecmp(str, "pcma") == 0)
+    return ALAW;
   else
     return NO_ENCODING;
 }
+
+// _CELT and _SILK seem to have been added with verson 1.6
+// Don't break the compilation if we have an older version
+struct string_table Opus_application[] = {
+  {"voip", OPUS_APPLICATION_VOIP},
+  {"audio", OPUS_APPLICATION_AUDIO},
+  {"lowdelay",OPUS_APPLICATION_RESTRICTED_LOWDELAY},
+#ifdef OPUS_APPLICATION_RESTRICTED_CELT
+  {"celt", OPUS_APPLICATION_RESTRICTED_CELT},
+#endif
+#ifdef OPUS_APPLICATION_SILK
+  {"silk", OPUS_APPLICATION_SILK},
+#endif
+  { NULL, -1 },
+};
+
+char const *opus_application_string(int x){
+  for(int i=0; Opus_application[i].value != -1; i++){
+    if(Opus_application[i].value == x)
+      return Opus_application[i].str;
+  }
+  return NULL;
+}
+
+// Interpret an Opus bandwidth constant
+int opus_bandwidth(char const **str,int code){
+  int bw = 0;
+  char const *s = NULL;
+  switch(code){
+  case OPUS_BANDWIDTH_NARROWBAND:
+    bw = 4000;
+    s = "narrowband";
+    break;
+  case OPUS_BANDWIDTH_MEDIUMBAND:
+    bw = 6000;
+    s = "mediumband";
+    break;
+  case OPUS_BANDWIDTH_WIDEBAND:
+    bw = 8000;
+    s = "wideband";
+    break;
+  case OPUS_BANDWIDTH_SUPERWIDEBAND:
+    bw = 12000;
+    s = "superwideband";
+    break;
+  case OPUS_BANDWIDTH_FULLBAND:
+    bw = 20000;
+    s = "fullband";
+    break;
+  default:
+    bw = 0;
+    s = "invalid";
+    break;
+  }
+  if(str != NULL)
+    *str = s;
+  return bw;
+}
+// Allowable Opus block durations, millisec * 10
+int Opus_blocksizes[] = {
+  25, 50, 100, 200, 400, 600, 800, 1000, 1200, -1,
+};
+int Opus_samprates[] = {
+  8000, 12000, 16000, 24000, 48000, -1,
+};
+
+// Return slowest bandwidth code that can support the specified bandwidth
+int opus_bandwidth_to_code(int bw){
+  if(bw <= 4000)
+    return OPUS_BANDWIDTH_NARROWBAND;
+  else if(bw <= 6000)
+    return OPUS_BANDWIDTH_MEDIUMBAND;
+  else if(bw <= 8000)
+    return OPUS_BANDWIDTH_WIDEBAND;
+  else if(bw <= 12000)
+    return OPUS_BANDWIDTH_SUPERWIDEBAND;
+  else
+    return OPUS_BANDWIDTH_FULLBAND;
+}
+struct string_table Opus_signal[] = {
+  {"auto", OPUS_AUTO},
+  {"music", OPUS_SIGNAL_MUSIC},
+  {"voice", OPUS_SIGNAL_VOICE},
+  {NULL,  -1},
+};
+
+bool legal_opus_size(int n){
+  // 2.5, 5, 10, 20, 40, 60, 80, 100, 120
+  if(n == 120 || n == 240 || n == 480 || n == 960 || n == 1920 || n == 2880 || n == 3840 || n == 4800 || n == 5760)
+    return true;
+  return false;
+}
+
+bool legal_opus_samprate(int n){
+  for(int i=0;Opus_samprates[i] > 0; i++){
+    if(n == Opus_samprates[i])
+      return true;
+  }
+  return false;
+}
+
+// μ-law from ChatGPT
+
+#define G711_BIAS 0x84   // 132
+#define G711_CLIP 32635
+_Static_assert(sizeof(unsigned int) == 4, "need 32-bit unsigned int for __builtin_clz");
+uint8_t float_to_mulaw(float fsample){
+  if (fsample > 1)
+    fsample = 1;
+  else if (fsample < -1)
+    fsample = -1;
+  int32_t sample = lrintf(ldexpf(fsample,15));
+  int sign = (sample < 0);
+  int32_t pcm  = sign ? -sample : sample;
+  if (pcm > G711_CLIP)
+    pcm = G711_CLIP;
+
+  pcm += G711_BIAS;
+
+  // Find segment (exponent)
+  int exponent = (31 - __builtin_clz((uint32_t)pcm)) - 7;
+  if (exponent < 0)
+    exponent = 0;
+  else if (exponent > 7)
+    exponent = 7;
+
+  // Mantissa is next 4 bits after exponent bit
+  int mantissa = (pcm >> (exponent + 3)) & 0x0F;
+
+  return (uint8_t)~((uint8_t)((exponent << 4) | mantissa) | (sign << 7));
+}
+
+float mulaw_to_float(uint8_t ulaw){
+  ulaw = (uint8_t)~ulaw;
+
+  int sign     = ulaw & 0x80;
+  int exponent = (ulaw >> 4) & 0x07;
+  int mantissa = ulaw & 0x0F;
+
+  int32_t pcm = ((mantissa << 3) + G711_BIAS) << exponent;
+  pcm -= G711_BIAS;
+
+  return ldexpf((float)(sign ? -pcm : pcm),-15);
+}
+
+#define G711_ALAW_CLIP 32635
+
+uint8_t float_to_alaw(float fsample){
+  // Clamp input
+  if(fsample > 1.0)
+    fsample =  1.0;
+  else if(fsample < -1.0)
+    fsample = -1.0;
+
+  int32_t sample = (int32_t)lrintf(ldexpf(fsample, 15));
+  int sign = (sample < 0);
+  int32_t pcm = sign ? -sample : sample;
+
+  if(pcm > G711_ALAW_CLIP)
+    pcm = G711_ALAW_CLIP;
+
+  int exponent = 0;
+  if(pcm >= 256)
+    exponent = (31 - __builtin_clz((uint32_t)pcm)) - 7; // __builtin_clz(0) is undefined
+
+  if(exponent < 0)
+    exponent = 0;
+  else if(exponent > 7)
+    exponent = 7;
+
+  int mantissa;
+  if(exponent == 0)
+    mantissa = (pcm >> 4) & 0x0F;
+  else
+    mantissa = (pcm >> (exponent + 3)) & 0x0F;
+
+  uint8_t a = (uint8_t)((exponent << 4) | mantissa);
+  a ^= (sign ? 0xD5 : 0x55);   // A-law XOR mask
+
+  return a;
+}
+
+float alaw_to_float(uint8_t alaw){
+  alaw ^= 0x55;
+
+  int sign     = alaw & 0x80;
+  int exponent = (alaw >> 4) & 0x07;
+  int mantissa = alaw & 0x0F;
+
+  int32_t pcm;
+  if (exponent == 0)
+    pcm = (mantissa << 4) + 8;
+  else
+    pcm = ((mantissa << 4) + 0x108) << (exponent - 1);
+
+  return ldexpf((float)(sign ? -pcm : pcm), -15);
+}
+
+// 1 kHz test sine waves at 0 dBm0
+uint8_t alaw_sine[] = {0x34, 0x21, 0x21, 034, 0xb4, 0xa1, 0xa1, 0xb4};
+uint8_t mulaw_sine[] = {0x1e, 0x0b, 0x0b, 0x1e, 0x9e, 0x8b, 0x8b, 0x9e};

@@ -3,14 +3,6 @@
 #ifndef _MISC_H
 #define _MISC_H 1
 
-// Note: files that include <math.h> before us must define _GNU_SOURCE prior to including math.h
-// or Linux will generate warnings about a lack of declarations for sincos and sincosf.
-// Apparently they are defined in math.h only when _GNU_SOURCE is defined.
-// Our re-defining _GNU_SOURCE and re-including math.h doesn't help if it has already been included
-#ifndef _GNU_SOURCE
-#define _GNU_SOURCE 1
-#endif
-
 #include <pthread.h>
 #include <stdint.h>
 #include <limits.h>
@@ -19,16 +11,33 @@
 #include <stdlib.h> // for ldiv(), free()
 #include <stdbool.h>
 #include <sys/errno.h>
+#include <string.h>
 #ifdef __linux__
 #include <bsd/string.h>
 #endif
 #include <assert.h>
+#include <sys/types.h>
+#include "config_paths.h" // pick up GIT macros
 
+#if 0
 // Must be a macro so __FILE__ and __TIMESTAMP__ will substitute correctly
-#define VERSION() { fprintf(stderr,"KA9Q Multichannel SDR %s last modified %s\n",__FILE__,__TIMESTAMP__); \
-		    fprintf(stderr,"Copyright 2025, Phil Karn, KA9Q. May be used under the terms of the GNU Public License\n");}
-
-
+#define VERSION() { fprintf(stderr,"KA9Q Multichannel SDR %s\n",__FILE__); \
+  fprintf(stderr,"Copyright 2026, Phil Karn, KA9Q. May be used under the terms of the GNU Public License\n"); \
+  fprintf(stderr,"   Repo: %s\n",GIT_REMOTE_URL); \
+  fprintf(stderr," Commit: %s\n",GIT_HASH); \
+  fprintf(stderr,"   Date: %s\n",GIT_TIME); \
+  fprintf(stderr," Branch:%s\n",GIT_BRANCH); \
+  fprintf(stderr,"Version: %s\n",GIT_VERSION); \
+  fprintf(stderr,"Summary: %s\n",GIT_SUMMARY); \
+}
+#else
+#define VERSION() { fprintf(stderr,"KA9Q Multichannel SDR %s\n",__FILE__); \
+  fprintf(stderr,"Copyright 2026, Phil Karn, KA9Q. May be used under the terms of the GNU Public License\n"); \
+  fprintf(stderr,"Git repository: %s\n",GIT_REMOTE_URL); \
+  fprintf(stderr,"Git branch: %s\n",GIT_BRANCH); \
+  fprintf(stderr,"Git commit hash: %s\n",GIT_HASH); \
+}
+#endif
 #define ASSERT_ZEROED(ptr, size) assert(memcmp(ptr, &(typeof(*(ptr))){0}, size) == 0)
 
 static inline void ASSERT_UNLOCKED(pthread_mutex_t *mutex){
@@ -44,10 +53,8 @@ static inline void ASSERT_UNLOCKED(pthread_mutex_t *mutex){
 #ifdef __arm__  // ARM platform
   #if defined(__ARM_FP16_FORMAT_IEEE)
     typedef __fp16 float16_t;  // ARM-specific half-precision support
-  #else
-    typedef float float16_t;  // Fallback on older ARM CPUs
+    #define HAS_FLOAT16 = 1
   #endif
-  #define HAS_FLOAT16 = 1
 #else  // Non-ARM platforms
   #if defined(__FLT16_MAX__)  // Check if _Float16 is natively supported
     typedef _Float16 float16_t;
@@ -55,32 +62,62 @@ static inline void ASSERT_UNLOCKED(pthread_mutex_t *mutex){
   #endif
 #endif
 
-#ifndef M_PIf
-#define M_PIf ((float)(M_PI))
-#endif
-#ifndef M_1_PIf
-#define M_1_PIf (1 / M_PIf)
-#endif
+void enable_ftz_daz(void);
+void disable_ftz_daz(void);
 
-#define M_1_2PIf (0.5f * M_1_PIf) // fraction of a rotation in one radian
 #define DEGPRA (180./M_PI)
 #define RAPDEG (M_PI/180.)
+#define TAI_GPS_OFFSET (19) // TAI is always and forever 19 seconds ahead of GPS
 #define GPS_UTC_OFFSET (18) // GPS ahead of utc by 18 seconds - make this a table!
+#define TAI_UTC_OFFSET (TAI_GPS_OFFSET+GPS_UTC_OFFSET)
 #define UNIX_EPOCH ((time_t)315964800) // GPS epoch on unix time scale
 
 #define BOLTZMANN (1.380649e-23) // Boltzmann's constant, J/K
 
-static float const SCALE16 = 1./INT16_MAX;
-static float const SCALE12 = 1/2048.;
-static float const SCALE8 = 1./INT8_MAX;  // Scale signed 8-bit int to float in range -1, +1
+static float const SCALE16 = 1.f/INT16_MAX;
+static float const SCALE12 = 1.f/2048.;
+static float const SCALE8 = 1.f/INT8_MAX;  // Scale signed 8-bit int to float in range -1, +1
 
+#define FULL_SAMPRATE (48000)
 
-int default_prio(void);
-void realtime(int prio);
-int norealtime(void);
-void stick_core(void);
-// Custom version of malloc that aligns to a cache line
-void *lmalloc(size_t size);
+typedef struct {
+  int64_t num;
+  uint64_t den;   // always > 0
+} rational_64;
+typedef __uint128_t U128;
+typedef __int128_t  I128;
+
+// Euclidean greatest common divisor algorithm
+static inline uint64_t gcd_u64(uint64_t a, uint64_t b){
+  while(b){
+    uint64_t t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+static inline U128 gcd_u128(U128 a, U128 b){
+  while(b){
+    U128 t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+static inline rational_64 rational_reduce_64(rational_64 x){
+  if(x.den == 0)
+    return x; // Invalid
+
+  uint64_t num = llabs(x.num);
+  uint64_t den = x.den;
+  uint64_t g = gcd_u64(num,den);
+  num /= g;
+  den /= g;
+  rational_64 result = { (int64_t)num,den};
+  if(x.num < 0)
+    result.num = -result.num;
+  return result;
+}
 
 // I *hate* this sort of pointless, stupid, gratuitous incompatibility that
 // makes a lot of code impossible to read and debug
@@ -110,17 +147,12 @@ int pthread_barrier_wait(pthread_barrier_t *barrier);
 #define malloc_usable_size(x) malloc_size(x)
 #define sincos(x,s,c) __sincos((x),(s),(c))
 #define sincosf(x,s,c) __sincosf((x),(s),(c))
-#define sincospi(x,s,c) __sincospi((x),(s),(c))
-#define sincospif(x,s,c) __sincospif((x),(s),(c))
 
 #else // !__APPLE__
 // Not apple (Linux, etc)
 
 #include <malloc.h>
 #define pthread_setname(x) pthread_setname_np(pthread_self(),(x))
-// Does anyone implement these natively for Linux?
-#define sincospi(x,s,c) sincos((x)*M_PI,(s),(c))
-#define sincospif(x,s,c) sincosf((x)*M_PIf,(s),(c))
 
 #endif // ifdef __APPLE__
 
@@ -147,30 +179,46 @@ static inline int init_recursive_mutex(pthread_mutex_t *m){
 		_x > _y ? _x : _y; })
 
 
-#define dB2power(x) (powf(10.0f,(x)/10.0f))
-#define power2dB(x) (10.0f * log10f(x))
-#define dB2voltage(x) (powf(10.0f, (x)/20.0f))
-#define voltage2dB(x) (20.0f * log10f(x))
+// power2dB and voltage2dB pass NAN to log10(), for debug trapping
+// They do avoid the divide-by-zero exception for the common case of 0 -> -infinity dB
+static inline double dB2power(double x){
+  return pow(10.0,x/10.0);
+}
+static inline double power2dB(double x){
+  if(x <= 0.0)
+    return -INFINITY;
+  return 10.0 * log10(x);
+}
+static inline double dB2voltage(double x){
+  return pow(10.0,x/20.0);
+}
+static inline double voltage2dB(double x){
+  if(x <= 0.0)
+    return -INFINITY;
+  return 20.0 * log10(x);
+}
 
-// Cos(x) + j*sin(x)
+// Does anyone implement these natively for Linux?
+// (I just did - KA9Q Jan 2026 -- see sincospi.c and sincospif.c)
+// It's a big win in DSP to keep phases as rotations (or half rotations),
+// rather than radians, to make phase wrap reduction really easy and accurate
+void sincospi(double x, double *s, double *c);
+void sincospif(float x, float *s, float *c);
+
+// How many names can people dream up for the same operation?
+// (I know, I'm an EE so I should say 'j', not 'i')
+// exp(i*x) = Cos(x) + i*sin(x)
+// "cosine plus i sine" -- heard a lot in grad school
 #define cisf(x) csincosf(x)
 #define cispif(x) csincospif(x)
 #define cis(x) csincos(x)
 #define cispi(x) csincospi(x)
 
-// Normalized sinc function sin(πx) / πx
-static inline float sincf(float x){
-  if(x == 0)
-    return 1;
-  return sinf(M_PI * x) / (M_PI * x);
-}
-static inline double sinc(float x){
+static inline double sinc(double x){
   if(x == 0)
     return 1;
   return sin(M_PI * x) / (M_PI * x);
 }
-
-
 extern const char *App_path;
 extern int Verbose;
 extern char const *Months[12];
@@ -183,21 +231,22 @@ char *format_utctime(char *result,int len,int64_t t);
 char *format_utctime_iso8601(char *result,int len,int64_t t);
 char *ftime(char *result,int size,int64_t t);
 void normalize_time(struct timespec *x);
+rational_64 parse_frequency_rational(char const *s,bool heuristics);
 double parse_frequency(char const *,bool);
 uint32_t nextfastfft(uint32_t n);
-int pipefill(int,void *,int);
+ssize_t pipefill(int,void *,size_t);
 void chomp(char *);
 char *ensure_suffix(char const *str, char const *suffix);
-uint32_t ElfHash(uint8_t const *s,int length);
+uint32_t ElfHash(uint8_t const *s,size_t length);
 uint32_t ElfHashString(char const *s);
-uint32_t fnv1hash(const uint8_t *s,int length);
+uint32_t fnv1hash(const uint8_t *s,size_t length);
 
 // Modified Bessel functions
-float i0(float const z); // 0th kind
-float i1(float const z); // 1st kind
+double i0(double const z); // 0th kind
+double i1(double const z); // 1st kind
 
-float xi(float thetasq);
-float fm_snr(float r);
+double xi(double thetasq);
+double fm_snr(double r);
 
 // Convert floating point sample to 16-bit integer, with clipping
 inline static int16_t scaleclip(float const x){
@@ -235,12 +284,12 @@ static inline double cnrm(double complex const x){
 }
 // Fast approximate square root, for signal magnitudes
 // https://dspguru.com/dsp/tricks/magnitude-estimator/
-static inline float approx_magf(float complex x){
-  static float const Alpha = 0.947543636291;
-  static float const Beta =  0.392485425092;
+static inline double approx_magf(double complex x){
+  static double const Alpha = 0.947543636291;
+  static double const Beta =  0.392485425092;
 
-  float absr = fabsf(__real__ x);
-  float absi = fabsf(__imag__ x);
+  double absr = fabs(__real__ x);
+  double absi = fabs(__imag__ x);
 
   return Alpha * max(absr,absi) + Beta * min(absr,absi);
 }
@@ -270,17 +319,17 @@ static inline int time_cmp(struct timespec const *a,struct timespec const *b){
     : (a->tv_nsec < b->tv_nsec) ? -1
     : 0;
 }
-static long long const BILLION = 1000000000LL;
-static long const MILLION = 1000000L;
+static int64_t const BILLION = 1000000000LL;
+static int const MILLION = 1000000;
 static int const THOUSAND = 1000;
 
 // Convert timespec (seconds, nanoseconds) to integer nanoseconds
 // Integer nanoseconds overflows past 584.94242 years. That's probably long enough
-static inline long long ts2ns(struct timespec const *ts){
+static inline int64_t ts2ns(struct timespec const *ts){
   return ts->tv_sec * BILLION + ts->tv_nsec;
 }
 // Convert integer nanosec count to timspec
-static inline void ns2ts(struct timespec *ts,long long ns){
+static inline void ns2ts(struct timespec *ts,int64_t ns){
   lldiv_t r = lldiv(ns,BILLION);
   ts->tv_sec = r.quot;
   ts->tv_nsec = r.rem;
@@ -298,7 +347,7 @@ static inline time_t gps_time_sec(void){
 }
 
 // Return time of day as nanosec from UTC epoch
-static inline long long utc_time_ns(void){
+static inline int64_t utc_time_ns(void){
   struct timespec now;
   clock_gettime(CLOCK_REALTIME,&now);
   return ts2ns(&now);
@@ -307,9 +356,7 @@ static inline long long utc_time_ns(void){
 // Return time of day as nanosec from GPS epoch
 // Note: assumes fixed leap second offset
 // Could be better derived direct from a GPS receiver without applying the leap second offset
-static inline long long gps_time_ns(void){
-  return utc_time_ns() - BILLION * (UNIX_EPOCH - GPS_UTC_OFFSET);
-}
+int64_t gps_time_ns(void);
 
 // How the free() library routine should have been all along: null the pointer after freeing!
 #define FREE(p) (free(p), p = NULL)
@@ -337,5 +384,22 @@ uint32_t round2(uint32_t v);
 
 void drop_cache(void *mem,size_t bytes);
 
+// Gaussian (normal) RV generation
+typedef struct {
+    uint64_t s[4];
+} xoshiro256ss_state;
+
+void xoshiro256ss_seed(xoshiro256ss_state *st, uint64_t seed);
+uint64_t xoshiro256ss_next(xoshiro256ss_state *st);
+void xoshiro256ss_jump(xoshiro256ss_state *st);
+void rand_init(void);
+double real_gauss(void);
+double uniform_rv(void);
+
+static inline double complex complex_gauss(void){
+  double r = real_gauss();
+  double i = real_gauss();
+  return CMPLX(r,i);
+}
 
 #endif // _MISC_H

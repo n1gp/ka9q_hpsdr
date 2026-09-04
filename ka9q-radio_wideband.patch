@@ -1,12 +1,11 @@
 diff --git a/src/rx888.c b/src/rx888.c
-index e53eb8f..67e82ef 100644
+index bcf1ff01..c89cb177 100644
 --- a/src/rx888.c
 +++ b/src/rx888.c
-@@ -616,6 +616,24 @@ static void rx_callback(struct libusb_transfer * const transfer){
-     if(libusb_submit_transfer(transfer) == 0)
-       sdr->xfers_in_progress++;
+@@ -667,6 +667,22 @@ static void rx_callback(struct libusb_transfer * const transfer){
    }
-+
+   sdr->last_callback_time = gps_time_ns();  // Reset watchdog only after read has succeeded
+   write_rfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT if block is complete
 +#if 1
 +  // periodically copy ADC data to ramdisk for wideband use
 +  FILE *binary_file = NULL;
@@ -23,7 +22,6 @@ index e53eb8f..67e82ef 100644
 +    }
 +  }
 +#endif
-+
-   write_rfilter(&frontend->in,NULL,sampcount); // Update write pointer, invoke FFT if block is complete
  }
  
+ static int rx888_usb_init(struct sdrstate *const sdr,const char * const firmware,unsigned int const queuedepth,unsigned int const reqsize){

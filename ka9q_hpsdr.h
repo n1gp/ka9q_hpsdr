@@ -67,6 +67,8 @@
 #define HERMES_LITE 6
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
+int Verbose = 0;
+
 struct main_cb {
     u_int rcvrs_mask;
     int nsamps_packet;
